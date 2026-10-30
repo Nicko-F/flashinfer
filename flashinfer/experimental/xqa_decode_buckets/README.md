@@ -3,6 +3,8 @@
 This backend uses the native XQA loader, BF16 QK/PV arithmetic, FP32 softmax and
 accumulation, and normalized-partial last-CTA merge. A separately prepared GPU
 work plan balances KV tiles across requests. Native XQA behavior is unchanged.
+This port changes task ownership, not the native MMA operand orientation; it does
+not implement a separate KQ-transposed/V-transposed-P-transposed compute core.
 
 Both the API and backend are experimental. Calling
 `flashinfer.xqa.create_xqa_decode_bucket_plan` or
@@ -91,7 +93,42 @@ The example compares native and bucket windows with the same caller-owned inputs
 and counts one assignment per layer window. It is not a model or HTTP benchmark.
 The tests cover actual task ownership, changed input/length/page-table Graph
 replays, zero/restore, packed native byte strides, independent workspaces/scales,
-counters and canaries. GPU compilation, Graph tests and timing are pending for
-this source preparation. Existing FlashInfer custom-op/fake decorators are
+counters and canaries. Existing FlashInfer custom-op/fake decorators are
 currently no-ops; the declarations here do not establish torch.compile/fullgraph
 compatibility. Framework integration must validate its actual capture boundary.
+
+## Module validation (2026-10-30)
+
+Source import, JIT and all six focused tests passed on an RTX 5090 (SM120),
+Torch 2.14.0+cu130 and CUDA 13. The tests include four changed-input Graph cases
+and both modes at small, uniform and skewed shapes. This validates the source
+port, not a vLLM integration or model/service speedup.
+
+The following are medians in microseconds for **two attention layers**. The
+candidate includes one plan preparation per two-layer window. Native is the mean
+of its before/after medians on the same inputs/device. The example uses seed 0,
+CUDA Graph timing, five warmups and twenty samples per arm, without CUPTI. Inputs
+are reused: these are hot-cache measurements, not rotated/cold-cache results.
+
+| Lengths | Mode | Native window (us) | Candidate window (us) | Native / candidate |
+| --- | --- | ---: | ---: | ---: |
+| 128K + 3 x 4K | persistent | 180.085 | 102.672 | 1.754 |
+| 512 | persistent | 23.525 | 34.986 | 0.672 |
+| 512 | aligned | 23.517 | 25.973 | 0.905 |
+| 32 x 8064 | persistent | 123.075 | 133.443 | 0.922 |
+| 32 x 8064 | aligned | 123.210 | 132.317 | 0.931 |
+| 128K + 31 x 4K | persistent | 1378.960 | 142.813 | 9.656 |
+| 128K + 31 x 4K | aligned | 1380.283 | 154.896 | 8.911 |
+
+There are clear small/uniform regressions; these modes are not a universal native
+replacement or a validated automatic dispatch policy. For B=1/L=512, the current
+persistent minimum budget of two tiles gives one active CTA, versus two native
+CTAs. Both bucket modes still launch an SM-sized grid. Separate planning/compute
+diagnostics are being collected before changing this policy.
+
+Runtime resources were 201 registers/thread for persistent and 186 for aligned,
+with 70,272 shared bytes, 112 local bytes and one resident CTA/SM for both. Aligned
+ptxas reports a 112-byte stack and zero spill loads/stores. Persistent compiler
+spill output was not retained, so its spill status is unconfirmed; local bytes
+alone are not evidence of spilling.
+
