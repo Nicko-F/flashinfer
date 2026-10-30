@@ -73,6 +73,7 @@ def _prepare(
     page_size: int,
     head_group_ratio: int,
     q_len_per_req: int,
+    query_tile: int,
 ) -> None:
     module, _ = get_module(
         not aligned,
@@ -80,6 +81,7 @@ def _prepare(
         page_size=page_size,
         head_group_ratio=head_group_ratio,
         multi_query=q_len_per_req > 1,
+        query_tile=query_tile,
     )
     module.plan(lengths, tasks, requests, spans, header, ctas, aligned)
 
@@ -96,6 +98,7 @@ def _fake_prepare(
     page_size: int,
     head_group_ratio: int,
     q_len_per_req: int,
+    query_tile: int,
 ) -> None:
     pass
 
@@ -128,6 +131,7 @@ def _compute(
     page_size: int,
     head_group_ratio: int,
     q_len_per_req: int,
+    query_tile: int,
 ) -> None:
     # Empty headers are the factory's explicit static direct-plan representation.
     direct = header.numel() == 0
@@ -138,6 +142,7 @@ def _compute(
         page_size=page_size,
         head_group_ratio=head_group_ratio,
         multi_query=q_len_per_req > 1,
+        query_tile=query_tile,
     )
     module.run(
         q,
@@ -189,6 +194,7 @@ def _fake_compute(
     page_size: int,
     head_group_ratio: int,
     q_len_per_req: int,
+    query_tile: int,
 ) -> None:
     pass
 
@@ -232,6 +238,7 @@ class BucketPlan:
     num_kv_heads: int
     head_group_ratio: int
     q_len_per_req: int
+    query_tile: int
     num_groups: int
     causal_mask: torch.Tensor
     grid_y_limit: int
@@ -265,6 +272,7 @@ class BucketPlan:
                     page_size=self.page_size,
                     head_group_ratio=self.head_group_ratio,
                     multi_query=self.q_len_per_req > 1,
+                    query_tile=self.query_tile,
                 )
                 module.plan_host(
                     self.host_seq_lens,
@@ -290,6 +298,7 @@ class BucketPlan:
                 self.page_size,
                 self.head_group_ratio,
                 self.q_len_per_req,
+                self.query_tile,
             )
         return self
 
@@ -318,9 +327,12 @@ def create_plan(
     num_kv_heads=1,
     head_group_ratio=6,
     q_len_per_req=1,
+    query_tile=16,
 ):
     check_head_config(num_kv_heads, head_group_ratio)
-    groups = query_group_count(num_kv_heads, head_group_ratio, q_len_per_req)
+    groups = query_group_count(
+        num_kv_heads, head_group_ratio, q_len_per_req, query_tile
+    )
     if mode not in ("persistent", "aligned"):
         raise ValueError("mode must be persistent or aligned")
     if planner not in ("gpu", "host"):
@@ -346,6 +358,7 @@ def create_plan(
         num_kv_heads,
         head_group_ratio,
         q_len_per_req,
+        query_tile,
     )
     capacity = plan_capacity(batch, ctas, page_table_width, page_size)
     total_capacity = workspace_capacity(
@@ -360,6 +373,7 @@ def create_plan(
         page_size=page_size,
         head_group_ratio=head_group_ratio,
         multi_query=q_len_per_req > 1,
+        query_tile=query_tile,
     )
     grid_y_limit = module.grid_y_limit(device.index)
     if groups > grid_y_limit:
@@ -409,6 +423,7 @@ def create_plan(
         num_kv_heads,
         head_group_ratio,
         q_len_per_req,
+        query_tile,
         groups,
         causal_mask,
         grid_y_limit,
@@ -539,5 +554,6 @@ def run(
             plan.page_size,
             plan.head_group_ratio,
             plan.q_len_per_req,
+            plan.query_tile,
         )
     return out

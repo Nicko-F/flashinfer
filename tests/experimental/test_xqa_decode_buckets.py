@@ -394,6 +394,7 @@ def _check_changed_graph(
     num_kv_heads=1,
     head_group_ratio=6,
     q_len_per_req=1,
+    query_tile=16,
 ):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
@@ -478,6 +479,7 @@ def _check_changed_graph(
         head_group_ratio=head_group_ratio,
         q_len_per_req=q_len_per_req,
         planner=planner,
+        query_tile=query_tile,
         host_seq_lens=torch.tensor(initial, dtype=torch.int32)
         if planner == "host"
         else None,
@@ -489,8 +491,9 @@ def _check_changed_graph(
     assert plan.num_kv_heads == num_kv_heads
     assert plan.head_group_ratio == head_group_ratio
     assert plan.q_len_per_req == q_len_per_req
+    assert plan.query_tile == query_tile
     assert plan.num_groups == num_kv_heads * (
-        (q_len_per_req * head_group_ratio + 15) // 16
+        (q_len_per_req * head_group_ratio + query_tile - 1) // query_tile
     )
     print(
         dict(
@@ -500,6 +503,7 @@ def _check_changed_graph(
             num_kv_heads=num_kv_heads,
             head_group_ratio=head_group_ratio,
             q_len_per_req=q_len_per_req,
+            query_tile=query_tile,
             resources=plan.resources,
             ctas=plan.ctas,
         ),
@@ -667,6 +671,41 @@ def _check_module_case(lengths, mode):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_query_tiles(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
+        )
+        spec = importlib.util.spec_from_file_location("xqa_tile_geometry", path)
+        geometry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(geometry)
+        for tokens in range(2, 6):
+            for ratio in (4, 6, 8):
+                for heads in (1, 2, 8):
+                    for tile in (16, 32):
+                        self.assertEqual(
+                            geometry.query_group_count(heads, ratio, tokens, tile),
+                            heads * ((tokens * ratio + tile - 1) // tile),
+                        )
+        self.assertEqual(
+            geometry.plan_geometry(32, 16, 170, 32, 4, 6, 3, 32), (43, False)
+        )
+        self.assertEqual(geometry.plan_geometry(4, 16, 170, 32, 4, 6, 3, 32), (8, True))
+        self.assertEqual(geometry.query_group_count(8, 8, 5, 32), 16)
+        # M32 can remove row groups and expand static direct eligibility.
+        self.assertEqual(
+            geometry.plan_geometry(3, 257, 170, 32, 1, 6, 5, 32), (99, True)
+        )
+        for sms in (132, 170, 200):
+            self.assertFalse(
+                geometry.plan_geometry(3, (sms + 1) * 8, sms, 32, 1, 6, 5, 32)[1]
+            )
+        for tile in (True, 0, 8, 64, 16.0):
+            with self.assertRaises(ValueError):
+                geometry.query_group_count(1, 6, 3, tile)
+        with self.assertRaisesRegex(ValueError, "requires q_len_per_req > 1"):
+            geometry.query_group_count(1, 6, 1, 32)
+
     def test_multi_query_groups_and_mask(self):
         path = (
             Path(__file__).resolve().parents[2]
@@ -993,16 +1032,30 @@ def _check_future_kv(
     direct=True,
     num_kv_heads=1,
     head_group_ratio=6,
+    query_tile=16,
 ):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
 
     tokens, length = 5, 257
     lengths = [length] if direct else [length, 0, tokens]
+    # Reserve more tiles than the whole SM budget, including the M32/G1 case.
+    # This is cold fixture construction; no capture or decode path reads it.
+    capacity = (
+        512
+        if direct
+        else (
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            + 1
+        )
+        * 256
+    )
     queries, data, scales, table, lens = _case(
         lengths,
         interleaved=interleaved,
-        capacity_length=512 if direct else 8193,
+        capacity_length=capacity,
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         head_group_ratio=head_group_ratio,
@@ -1025,6 +1078,7 @@ def _check_future_kv(
         head_group_ratio=head_group_ratio,
         q_len_per_req=tokens,
         mode=mode,
+        query_tile=query_tile,
         planner=planner,
         host_seq_lens=torch.tensor(lengths, dtype=torch.int32)
         if planner == "host"
@@ -1073,6 +1127,7 @@ def _check_future_kv(
             causal_future_v=True,
             length=length,
             q_len_per_req=tokens,
+            query_tile=query_tile,
             mode=mode,
             planner=planner,
             page_size=page_size,
@@ -1083,6 +1138,68 @@ def _check_future_kv(
         ),
         flush=True,
     )
+
+
+class BucketQueryTileTests(unittest.TestCase):
+    def test_causal_partition_smoke(self):
+        _check_future_kv("persistent", False, head_group_ratio=8, query_tile=32)
+
+    def test_prepared_m32_replay(self):
+        for tokens, heads, ratio, page in ((3, 4, 6, 32), (5, 2, 8, 64), (2, 2, 4, 16)):
+            for mode in ("persistent", "aligned"):
+                for planner in ("gpu", "host"):
+                    for interleaved in (False, True):
+                        _check_changed_graph(
+                            mode,
+                            interleaved,
+                            planner=planner,
+                            page_size=page,
+                            num_kv_heads=heads,
+                            head_group_ratio=ratio,
+                            q_len_per_req=tokens,
+                            query_tile=32,
+                        )
+
+    def test_direct_m32_replay(self):
+        for tokens, heads, ratio, page in ((3, 4, 6, 32), (5, 2, 8, 64)):
+            for mode in ("persistent", "aligned"):
+                for planner in ("gpu", "host"):
+                    for batch, capacity in ((1, 8193), (4, 512)):
+                        _check_changed_graph(
+                            mode,
+                            batch == 4,
+                            planner=planner,
+                            page_size=page,
+                            num_kv_heads=heads,
+                            head_group_ratio=ratio,
+                            q_len_per_req=tokens,
+                            query_tile=32,
+                            direct=True,
+                            direct_batch=batch,
+                            capacity_length=capacity,
+                        )
+
+    def test_future_kv_m32(self):
+        for heads, ratio, page in ((1, 6, 32), (2, 8, 64)):
+            for direct in (False, True):
+                for mode in ("persistent", "aligned"):
+                    for planner in ("gpu", "host"):
+                        _check_future_kv(
+                            mode,
+                            page == 64,
+                            planner,
+                            page,
+                            direct,
+                            heads,
+                            ratio,
+                            query_tile=32,
+                        )
+
+    def test_default_m16_anchor(self):
+        _check_changed_graph(
+            "persistent", False, num_kv_heads=4, head_group_ratio=6, q_len_per_req=3
+        )
+        _check_changed_graph("persistent", False, direct=True, capacity_length=512)
 
 
 class BucketMultiQueryTests(unittest.TestCase):

@@ -20,10 +20,22 @@ def check_query_length(q_len_per_req: int = 1) -> None:
         raise ValueError("q_len_per_req must be an integer in [1,5]")
 
 
-def query_group_count(num_kv_heads=1, head_group_ratio=6, q_len_per_req=1):
-    check_head_config(num_kv_heads, head_group_ratio)
+def check_query_tile(query_tile=16, q_len_per_req=1):
     check_query_length(q_len_per_req)
-    groups = num_kv_heads * ((q_len_per_req * head_group_ratio + 15) // 16)
+    if type(query_tile) is not int or query_tile not in (16, 32):
+        raise ValueError("query_tile must be 16 or 32")
+    if q_len_per_req == 1 and query_tile != 16:
+        raise ValueError("query_tile=32 requires q_len_per_req > 1")
+
+
+def query_group_count(
+    num_kv_heads=1, head_group_ratio=6, q_len_per_req=1, query_tile=16
+):
+    check_head_config(num_kv_heads, head_group_ratio)
+    check_query_tile(query_tile, q_len_per_req)
+    groups = num_kv_heads * (
+        (q_len_per_req * head_group_ratio + query_tile - 1) // query_tile
+    )
     if groups > (1 << 31) - 1:
         raise ValueError("Query row-group count must fit int32")
     return groups
@@ -77,12 +89,15 @@ def plan_geometry(
     num_kv_heads: int = 1,
     head_group_ratio: int = 6,
     q_len_per_req: int = 1,
+    query_tile: int = 16,
 ) -> tuple[int, bool]:
     """Return checked CTA capacity and static direct-path eligibility."""
     plan_capacity(batch, batch, table_width, page_size)
     if type(sm_count) is not int or not 1 <= sm_count <= MAX_CTAS:
         raise ValueError("Expected a bounded positive integer SM count")
-    groups = query_group_count(num_kv_heads, head_group_ratio, q_len_per_req)
+    groups = query_group_count(
+        num_kv_heads, head_group_ratio, q_len_per_req, query_tile
+    )
     if batch * groups > (1 << 31) - 1:
         raise ValueError("Request/group counters must fit int32")
     # All inputs were checked before products or rounding. Live lengths stay

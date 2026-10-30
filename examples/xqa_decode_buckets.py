@@ -75,6 +75,7 @@ def compare_planners(args):
                 num_kv_heads=args.num_kv_heads,
                 head_group_ratio=args.head_group_ratio,
                 q_len_per_req=args.q_len_per_req,
+                query_tile=args.query_tile,
                 mode=args.mode,
                 planner=planner,
                 host_seq_lens=cpu_lengths if planner == "host" else None,
@@ -178,6 +179,7 @@ def compare_planners(args):
                 page_size=args.page_size,
                 head_group_ratio=args.head_group_ratio,
                 multi_query=args.q_len_per_req > 1,
+                query_tile=args.query_tile,
             )
             staging = torch.empty_like(host._host_descriptors, pin_memory=True)
             fill = lambda: module.plan_host(
@@ -251,7 +253,7 @@ def compare_planners(args):
         temporary.replace(target)
 
 
-def suite_cases():
+def suite_cases(suite="tencent22"):
     """Tencent length distributions, with the documented bounded adaptation."""
     patterns = {
         "uniform512": [512] * 32,
@@ -271,7 +273,7 @@ def suite_cases():
         (64, 8, 8, 5, ("uniform512", "uniform4096", "extreme", "one64k7")),
         (32, 4, 4, 4, ("one64k7",)),
     ]
-    return [
+    cases = [
         dict(
             case_id=f"p{page}_h{heads}_r{ratio}_t{tokens}_{pattern}",
             pattern=pattern,
@@ -284,6 +286,16 @@ def suite_cases():
         for page, heads, ratio, tokens, names in configs
         for pattern in names
     ]
+    if suite == "query_tiles4":
+        return [
+            case
+            for case in cases
+            if (case["num_kv_heads"], case["q_len_per_req"]) == (4, 3)
+            and case["pattern"] in ("uniform512", "uniform4096", "one64k7")
+            or (case["num_kv_heads"], case["q_len_per_req"], case["pattern"])
+            == (8, 5, "one64k7")
+        ]
+    return cases
 
 
 def atomic_json(target, value):
@@ -307,7 +319,8 @@ def run_suite(args):
         cuda_graph=True,
         cupti=False,
         cold_l2_cache=False,
-        cases=suite_cases(),
+        cases=suite_cases(args.suite),
+        query_tiles=[16, 32] if args.suite == "query_tiles4" else [16],
     )
     state = dict(configuration=configuration, complete=False, records=[], failures=[])
     if target.exists():
@@ -326,6 +339,7 @@ def run_suite(args):
         case_args = copy.copy(args)
         for key in ("page_size", "num_kv_heads", "head_group_ratio", "q_len_per_req"):
             setattr(case_args, key, case[key])
+        case_args.compare_query_tiles = args.suite == "query_tiles4"
         try:
             result = run_case(
                 case_args, case["lengths"], max(case["lengths"]), suite=True
@@ -351,6 +365,8 @@ def main(argv=None):
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--head-group-ratio", type=int, choices=(4, 6, 8), default=6)
     parser.add_argument("--q-len-per-req", type=int, choices=(1, 2, 3, 4, 5), default=1)
+    parser.add_argument("--query-tile", type=int, choices=(16, 32), default=16)
+    parser.add_argument("--compare-query-tiles", action="store_true")
     parser.add_argument(
         "--capacity-length", type=int, help="Reserved table capacity in tokens"
     )
@@ -360,7 +376,7 @@ def main(argv=None):
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--compare-planners", action="store_true")
     parser.add_argument("--output-json")
-    parser.add_argument("--suite", choices=("tencent22",))
+    parser.add_argument("--suite", choices=("tencent22", "query_tiles4"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--diagnose",
@@ -378,12 +394,20 @@ def main(argv=None):
             or args.compare_planners
             or args.diagnose
             or args.capacity_length is not None
+            or args.query_tile != 16
+            or args.compare_query_tiles
         ):
             parser.error("Suite requires --layers 1, persistent mode and --output-json")
         run_suite(args)
         return
     if args.resume:
         parser.error("--resume requires --suite")
+    if (args.query_tile == 32 or args.compare_query_tiles) and args.q_len_per_req == 1:
+        parser.error("M32 requires --q-len-per-req greater than 1")
+    if args.compare_query_tiles and (
+        args.query_tile != 16 or args.compare_planners or args.diagnose
+    ):
+        parser.error("--compare-query-tiles uses M16/M32 with the GPU planner")
     if args.compare_planners:
         if args.layers < 1:
             parser.error("Use at least one layer")
@@ -419,15 +443,23 @@ def run_case(args, lengths, capacity, *, suite=False):
         table[row, :count] = torch.arange(offset, offset + count, device=device)
         offset += count
     lens = torch.tensor(lengths, dtype=torch.int32, device=device)
-    plan = create_xqa_decode_bucket_plan(
-        lens,
-        page_table_width=width,
-        page_size=args.page_size,
-        mode=args.mode,
-        num_kv_heads=args.num_kv_heads,
-        head_group_ratio=args.head_group_ratio,
-        q_len_per_req=args.q_len_per_req,
-    )
+
+    def make_plan(query_tile):
+        return create_xqa_decode_bucket_plan(
+            lens,
+            page_table_width=width,
+            page_size=args.page_size,
+            mode=args.mode,
+            num_kv_heads=args.num_kv_heads,
+            head_group_ratio=args.head_group_ratio,
+            q_len_per_req=args.q_len_per_req,
+            query_tile=query_tile,
+        )
+
+    plan = make_plan(args.query_tile)
+    plans = {args.query_tile: plan}
+    if args.compare_query_tiles:
+        plans[32] = make_plan(32)
     bank = []
     for _ in range(args.layers):
         q = (
@@ -468,8 +500,26 @@ def run_case(args, lengths, capacity, *, suite=False):
         native_scratch = torch.zeros(40 * 2**20, dtype=torch.uint8, device=device)
         bank.append((q, k, v, ks, vs, out, native_out, workspace, native_scratch))
 
-    def compute():
-        for q, k, v, ks, vs, out, _, workspace, _ in bank:
+    tile_banks = {args.query_tile: bank}
+    for tile, selected_plan in plans.items():
+        if tile != args.query_tile:
+            tile_banks[tile] = [
+                (
+                    q,
+                    k,
+                    v,
+                    ks,
+                    vs,
+                    torch.empty_like(out),
+                    native_out,
+                    selected_plan.create_workspace(),
+                    scratch,
+                )
+                for q, k, v, ks, vs, out, native_out, _, scratch in bank
+            ]
+
+    def compute(selected_plan=plan, selected_bank=bank):
+        for q, k, v, ks, vs, out, _, workspace, _ in selected_bank:
             xqa_decode_with_buckets(
                 q,
                 k,
@@ -477,16 +527,16 @@ def run_case(args, lengths, capacity, *, suite=False):
                 ks,
                 vs,
                 table,
-                plan,
+                selected_plan,
                 workspace,
                 bmm1_scale=0.7 / 16,
                 bmm2_scale=1.3,
                 out=out,
             )
 
-    def candidate():
-        plan.prepare()
-        compute()
+    def candidate(selected_plan=plan, selected_bank=bank):
+        selected_plan.prepare()
+        compute(selected_plan, selected_bank)
 
     def native():
         for q, k, v, ks, vs, _, native_out, _, scratch in bank:
@@ -506,12 +556,13 @@ def run_case(args, lengths, capacity, *, suite=False):
             )
 
     native()
-    candidate()
+    for tile, selected_plan in plans.items():
+        candidate(selected_plan, tile_banks[tile])
     torch.cuda.synchronize()
 
-    def check_outputs():
+    def check_outputs(selected_bank=bank):
         errors = []
-        for _, _, _, _, _, out, native_out, workspace, _ in bank:
+        for _, _, _, _, _, out, native_out, workspace, _ in selected_bank:
             error = (
                 out.float() - native_out.float()
             ).norm() / native_out.float().norm().clamp_min(1e-8)
@@ -537,6 +588,7 @@ def run_case(args, lengths, capacity, *, suite=False):
         num_kv_heads=args.num_kv_heads,
         head_group_ratio=args.head_group_ratio,
         q_len_per_req=args.q_len_per_req,
+        query_tile=args.query_tile,
         groups=plan.num_groups,
         direct=plan.direct,
         assignment_per_window=0 if plan.direct else 1,
@@ -545,6 +597,20 @@ def run_case(args, lengths, capacity, *, suite=False):
     result = dict(
         configuration=configuration, arms=[], relative_rms_before=errors_before
     )
+    if args.compare_query_tiles:
+        result["tile_configurations"] = {
+            str(tile): dict(
+                query_tile=tile,
+                resources=selected_plan.resources,
+                groups=selected_plan.num_groups,
+                ctas=selected_plan.ctas,
+                scratch_bytes=selected_plan.scratch_bytes,
+                direct=selected_plan.direct,
+                assignment_per_window=0 if selected_plan.direct else 1,
+                relative_rms_before=check_outputs(tile_banks[tile]),
+            )
+            for tile, selected_plan in plans.items()
+        }
     if args.diagnose:
         if plan.direct:
             # Explicitly derived outside timing; not a profiler launch record.
@@ -631,14 +697,39 @@ def run_case(args, lengths, capacity, *, suite=False):
             ),
             flush=True,
         )
-    if args.benchmark or args.diagnose or suite:
+    if args.benchmark or args.diagnose or suite or args.compare_query_tiles:
         # Warm both and bracket the candidate with native; report absolute samples.
         windows = (
             ("native_before", native),
             ("candidate", candidate),
             ("native_after", native),
         )
-        if args.diagnose:
+        direct_aliases = {}
+        if args.compare_query_tiles:
+            windows = [("native_before", native)]
+            for tile, selected_plan in plans.items():
+                selected_bank = tile_banks[tile]
+                compute_label, full_label = (
+                    f"m{tile}_compute_only",
+                    f"m{tile}_assign_and_compute",
+                )
+                windows.append(
+                    (
+                        compute_label,
+                        lambda p=selected_plan, b=selected_bank: compute(p, b),
+                    )
+                )
+                if selected_plan.direct:
+                    direct_aliases[compute_label] = full_label
+                else:
+                    windows.append(
+                        (
+                            full_label,
+                            lambda p=selected_plan, b=selected_bank: candidate(p, b),
+                        )
+                    )
+            windows.append(("native_after", native))
+        elif args.diagnose:
             assignment_windows = () if plan.direct else (("assign_only", plan.prepare),)
             windows = (
                 ("native_before", native),
@@ -670,8 +761,11 @@ def run_case(args, lengths, capacity, *, suite=False):
             )
             result["arms"].append(record)
             print(record, flush=True)
-            if suite and plan.direct and label == "compute_only":
-                identical = dict(record, arm="assign_and_compute", same_window_as=label)
+            alias = direct_aliases.get(label)
+            if alias or suite and plan.direct and label == "compute_only":
+                identical = dict(
+                    record, arm=alias or "assign_and_compute", same_window_as=label
+                )
                 result["arms"].append(identical)
                 print(identical, flush=True)
         if args.diagnose:
@@ -680,6 +774,11 @@ def run_case(args, lengths, capacity, *, suite=False):
                 flush=True,
             )
     result.update(relative_rms_after=check_outputs(), counters_reset=True)
+    if args.compare_query_tiles:
+        for tile in plans:
+            result["tile_configurations"][str(tile)].update(
+                relative_rms_after=check_outputs(tile_banks[tile]), counters_reset=True
+            )
     if suite:
         print(
             dict(relative_rms_after=result["relative_rms_after"], counters_reset=True),

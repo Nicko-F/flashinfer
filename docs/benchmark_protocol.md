@@ -68,3 +68,13 @@ case output/counter checks passing and no retries or post-result kernel tuning.
 Seventeen full-window medians are faster, five regress; the largest relative RMS
 error is0.004230 and maximum native bracket drift is0.84%. Full results and
 limitations are in the [module report](../flashinfer/experimental/xqa_decode_buckets/README.md#stage-final-single-attention-matrix-2026-10-30-utc).
+
+## Focused query-tile follow-up
+
+`--suite query_tiles4` compares native, M16 and explicit M32 over the same
+operand bank, with independent candidate plans/workspaces. It selects T3/R6/H4/P32
+uniform512, uniform4096 and one64k7, plus T5/R8/H8/P64 one64k7. Native brackets
+both candidates; each candidate retains separate compute-only and complete
+planning-inclusive windows. The same helper, precision and sampling settings
+above apply. This diagnoses the M16 row-group split; it does not replace the
+22-case historical matrix or constitute a new full performance qualification.

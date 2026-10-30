@@ -24,6 +24,7 @@ an issue nor a target release is claimed by this preparation patch.
 - Contiguous BF16 Q/output `[B,H*R,256]` for T1 and `[B,T,H*R,256]` for T>1,
   with positive `H=num_kv_heads`
   (default 1) and `R=head_group_ratio` in `{4,6,8}` (default 6).
+- Explicit `query_tile=16` (default) or 32 physical rows; M32 requires T>1.
 - Packed NVFP4 K/V `[pages,page_size,H,128]`, E4M3 block scales
   `[pages,page_size,H,16]`, NHD, with `page_size` in `{16,32,64}` (default 32).
   Native page/token byte strides are retained; the packed head is contiguous.
@@ -42,7 +43,7 @@ There is no model, TP degree, layer count, run-directory or configured 128K
 requirement. Width is bounded by `(INT32_MAX - 255) // page_size`: this keeps padded tile
 ends and all 32 dense table rows representable. CTA count is
 `C = max(B, min(ceil(SMs/G), B * ceil(width * page_size / 256)))` per independent
-row group, where `G = H * ceil(T*R/16)`,
+row group, where `G = H * ceil(T*R/query_tile)`,
 with at least B CTAs for zero-row
 owners. This uses static table capacity, not a device-to-host length read. A wide
 reserved table can retain a full grid even when its live prefix is short.
@@ -117,8 +118,10 @@ The same 16-row padded MMA tile and 256-thread warp layout support ratios4/6/8;
 resource reports must still be measured for each compiled specialization.
 
 For uniform T>1, `q_len_per_req` selects the native `SPEC_DEC` path with
-`M_TILESIZE=16`, `IS_SPEC_DEC_TREE=0` and no `SPEC_Q_SEQ_LEN` swap specialization.
-Each KV head owns `ceil(T*R/16)` row blocks; the prepared grid is `(C,G,1)`.
+`M_TILESIZE=query_tile`, `IS_SPEC_DEC_TREE=0` and no `SPEC_Q_SEQ_LEN` swap
+specialization. The explicit `query_tile` choice is retained in the plan and
+JIT key; no automatic tile selection or native dispatcher change is involved.
+Each KV head owns `ceil(T*R/query_tile)` row blocks; the prepared grid is `(C,G,1)`.
 One request descriptor plan is reused across all G groups. Scratch group strides
 retain the live compact layout above and counters use `request * G + group`.
 Q/cache/output mapping follows the native head-token rules with explicit task
@@ -133,9 +136,13 @@ Output-helper debug assertions also distinguish local tile row r from global
 head-token row m, using actual T for bounds; output indexing and arithmetic are
 unchanged. This matters for partial M16 groups at T3/R6 and T5/R4.
 
-The 16-row choice retains the existing physical warp tile rather than increasing
-simultaneously live rows. Its registers/shared memory/spills still require
-measurement. Multiple row blocks can reread KV compared with native's default
+The default 16-row choice retains the original physical warp tile. M32 reuses
+native arithmetic, barriers, causal masks and merge with more live rows. From
+native SharedMem layout, persistent Q and X each grow by 8KiB, predicting
+86,656 shared bytes versus 70,272 for M16. Row-stat padding and K/V buffers stay
+unchanged. Warp accumulator storage doubles from 32 to 64 FP32 values per thread;
+actual registers, spills and occupancy must be measured. M32 is an explicit
+alternative, with no performance guarantee. Multiple row blocks can reread KV compared with native's default
 tile selection, so support does not imply a universal multi-query speedup.
 The public native control uses its own default dispatcher with flattened Q/output
 views, `q_len_per_req=T` and the same causal mask. Ragged queries, arbitrary tree
@@ -608,3 +615,60 @@ The JSON records raw samples, output errors, counters and resources after each
 completed case using atomic replacement. Add `--resume` to skip completed cases
 with matching suite configuration; use a new output file when configuration
 changes. Failed case records are preserved in the failure list.
+
+## Explicit M32 query tile (2026-10-30 UTC)
+
+The M32 smoke passed in 11.871 seconds. Initial qualification ran eleven groups
+in 102.454 seconds: ten passed, while one future-mask fixture asserted that its
+plan must be prepared. M32 reduced that fixture to one row group, so its reserved
+99 tiles correctly fit the 170-SM direct budget. The fixture's capacity now
+derives from the current device SM count outside capture to guarantee prepared
+ownership. Only that failed method was rerun; all sixteen future-mask cases
+passed in 2.438 seconds. The failed run remains preserved. Kernel code did not
+change after this fixture correction.
+
+Combined qualification covers seven CPU groups and 58 GPU cases: 24 prepared
+changed-input Graph replays, sixteen direct replays, sixteen causal future-KV
+checks and two default-M16 compatibility anchors. Both planners, ownership modes,
+cache layouts, zero/restore and partial row groups are covered. T3/R6 uses
+eighteen rows; T5/R8 exercises a second M32 group with only eight active rows.
+
+All twelve compiled variants, including nine M32 variants, report zero spill
+loads/stores. Every observed M32 kernel uses 86,656 shared bytes, confirming the
+resource prediction, and one resident CTA per SM. M32 registers range from 219
+to 235; stack allocations are 64/112/128 bytes. The persistent R6/page32 M32
+kernel uses 219 registers and a 112-byte stack, versus M16's 224 registers and
+70,272 shared bytes. Persistent R8/page64 M32 uses 232 registers and a 64-byte
+stack, versus M16's 221 registers. No register cap was added.
+
+One bounded process measured the four planned single-attention cases once.
+M16 and M32 share identical Q/KV/scales/page tables and native outputs, with
+independent plans, candidate outputs and workspaces. Native before/after brackets
+both candidates and retains its default dispatch. RTX 5090 physical GPU0/NUMA0
+CPU affinity, seed0, static device lengths, five warmups and twenty hot CUDA Graph
+samples per arm match the prior helper protocol; CUPTI and cold-L2 handling are
+off. JIT/allocation are excluded. Every full candidate window includes one GPU
+Assign, and output/counter checks pass before and after timing. Units are
+microseconds; speedups use the full candidate windows and mean native controls.
+Across both candidates in all four cases, maximum relative RMS error is
+0.0041943 and maximum native-before/after median drift is 0.191%.
+
+| P/H/R/T | Length pattern | Native before / after | M16 compute / full | M32 compute / full | M32 vs M16 | M32 vs native |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 32/4/6/3 | 32 x 512 | 24.336 / 24.336 | 36.893 / 43.382 | 24.950 / 31.914 | 1.36x | 0.76x |
+| 32/4/6/3 | 32 x 4096 | 160.835 / 161.142 | 231.286 / 239.259 | 224.323 / 232.259 | 1.03x | 0.69x |
+| 32/4/6/3 | 65536 + 7 x 4096 | 482.032 / 482.574 | 208.144 / 213.059 | 107.997 / 113.219 | 1.88x | 4.26x |
+| 64/8/8/5 | 65536 + 7 x 4096 | 1131.331 / 1133.482 | 625.834 / 627.370 | 601.870 / 605.590 | 1.04x | 1.87x |
+
+M32 improves over M16 in these four measurements, but both balanced T3 cases
+still regress against native in the full window. Short balanced compute is near
+native before planning cost; long balanced compute remains slower. Removing one
+row group therefore does not resolve every limitation, and these measurements
+do not isolate the remaining cause. Independently timed components are not
+assumed additive. M16 stays the default, with no automatic tile/shape policy or
+universal non-regression claim. Broader curves, actual compile/opcheck support
+and model/serving integration remain separate work.
+
+Use `--query-tile 32 --q-len-per-req 3` for an explicit M32 example, or compare
+the same four cases with `--suite query_tiles4 --layers 1 --output-json tiles.json`.
+The comparison JSON retains both candidates' resource, error and timing records.

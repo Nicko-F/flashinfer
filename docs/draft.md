@@ -30,7 +30,10 @@ and the completed22-case representative matrix. Five full-window regressions
 remain, so support for a configuration does not imply a speedup.
 
 Let G be the number of independent head/query-row groups. For q1, G equals the
-KV head count. Multi-query uses G=KV_heads*ceil(query_length*ratio/16). A group
+KV head count. Multi-query uses G=KV_heads*ceil(query_length*ratio/query_tile).
+The default query tile is16; an explicit32-row alternative for multi-query
+reuses the native SPEC_DEC core. Tile selection is cold plan metadata and a
+JIT specialization, not a runtime scan or change to native XQA dispatch. A group
 receives ceil(SMs/G) CTAs, bounded below by the batch and above by static tile
 capacity. All groups reuse the request task table but have disjoint scratch and
 request/group completion counters. This avoids assigning a full SM-sized grid

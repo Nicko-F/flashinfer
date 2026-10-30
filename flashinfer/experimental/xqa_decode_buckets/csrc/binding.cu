@@ -129,7 +129,7 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
   CHECK_DIM(3, q);
 #endif
   TVM_FFI_ICHECK(heads >= 1 && heads <= INT32_MAX);
-  int64_t row_groups = (q_tokens * headGrpSize + 15) / 16;
+  int64_t row_groups = (q_tokens * headGrpSize + warpTile.y - 1) / warpTile.y;
   int64_t groups = heads * row_groups;
   TVM_FFI_ICHECK_LE(groups, INT32_MAX / capacity);
   TVM_FFI_ICHECK_LE(heads * plan.batch * headGrpSize * q_tokens, UINT32_MAX);

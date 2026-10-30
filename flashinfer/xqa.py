@@ -46,6 +46,7 @@ def create_xqa_decode_bucket_plan(
     num_kv_heads: int = 1,
     head_group_ratio: int = 6,
     q_len_per_req: int = 1,
+    query_tile: int = 16,
     mode: str = "persistent",
     planner: str = "gpu",
     host_seq_lens: Optional[torch.Tensor] = None,
@@ -96,7 +97,10 @@ def create_xqa_decode_bucket_plan(
     include the complete T-token causal suffix: active lengths must be at least
     T, or zero for padded requests. Query row t sees keys before ``L-T+t+1``.
     A constant packed causal mask is allocated once with the plan. Groups are
-    ``H * ceil(T*R/16)``; planning budgets, scratch and counters use that count.
+    ``H * ceil(T*R/query_tile)``; planning budgets, scratch and counters use that
+    count. ``query_tile`` is 16 by default; 32 explicitly selects native M32
+    compute for T>1. It does not change native XQA dispatch or select a tile
+    automatically. T1 requires query_tile=16.
     No ragged queries, arbitrary tree masks or speculative-generation service
     are enabled by this explicit module call.
 
@@ -113,6 +117,7 @@ def create_xqa_decode_bucket_plan(
         num_kv_heads=num_kv_heads,
         head_group_ratio=head_group_ratio,
         q_len_per_req=q_len_per_req,
+        query_tile=query_tile,
         mode=mode,
         planner=planner,
         host_seq_lens=host_seq_lens,

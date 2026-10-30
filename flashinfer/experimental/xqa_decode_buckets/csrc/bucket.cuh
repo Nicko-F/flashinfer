@@ -48,12 +48,14 @@ struct ComputeParams {
 static_assert(ctaSize == 256 && ctaShapeInWarps.x == 4 && ctaShapeInWarps.y == 1 &&
               ctaShapeInWarps.z == 2 && grpLoadV && nbVBuffers == 2 &&
               gemm1NbWarpGrps == 1 && nbHeadSplits == 1 && headElems == 256 &&
-              (headGrpSize == 4 || headGrpSize == 6 || headGrpSize == 8) && warpTile.y == 16 &&
+              (headGrpSize == 4 || headGrpSize == 6 || headGrpSize == 8) &&
               BEAM_WIDTH == 1 && USE_CUSTOM_BARRIER == 1,
               "Task/barrier ownership supports the declared R4,R6,R8/D256 core");
 #if SPEC_DEC
-static_assert(rowsPerBlock == 16 && !IS_SPEC_DEC_TREE,
-              "Uniform causal query suffixes retain the native 16-row tile");
+static_assert((rowsPerBlock == 16 || rowsPerBlock == 32) && !IS_SPEC_DEC_TREE,
+              "Uniform causal query suffixes use native M16 or M32 tiles");
+#else
+static_assert(warpTile.y == 16, "Single-query compute retains the native M16 tile");
 #endif
 static_assert(ctaTile.x == Tile);
 static_assert((tokensPerPage == 16 || tokensPerPage == 32 || tokensPerPage == 64) &&
@@ -135,8 +137,8 @@ __global__ void assign(PlanParams p) {
 
 __device__ __forceinline__ void clear_empty(ComputeParams const& p, int request, int group, int tid) {
 #if SPEC_DEC
-  int head = group / p.row_groups, begin = (group % p.row_groups) * 16;
-  int rows = min(16, p.q_tokens * int(headGrpSize) - begin);
+  int head = group / p.row_groups, begin = (group % p.row_groups) * int(warpTile.y);
+  int rows = min(int(warpTile.y), p.q_tokens * int(headGrpSize) - begin);
   for (int i = tid; i < rows * 256; i += 256) {
     int row = begin + i / 256, token = row / headGrpSize, qhead = head * headGrpSize + row % headGrpSize;
     uint64_t index = ((uint64_t(request) * p.q_tokens + token) * p.kv_heads * headGrpSize + qhead) * 256 + i % 256;
@@ -205,7 +207,7 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
         0
 #endif
 #if SPEC_DEC
-        , uint32_t(group), uint32_t(p.groups), uint32_t((group % p.row_groups) * 16)
+        , uint32_t(group), uint32_t(p.groups), uint32_t((group % p.row_groups) * warpTile.y)
 #endif
     };
     KVCacheList<true> cache{reinterpret_cast<GMemCacheHead*>(const_cast<uint8_t*>(p.k)),
