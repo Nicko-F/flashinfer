@@ -2,6 +2,7 @@
 """Runnable module example; benchmarks include assignment for prepared plans."""
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import statistics
@@ -250,7 +251,97 @@ def compare_planners(args):
         temporary.replace(target)
 
 
-def main():
+def suite_cases():
+    """Tencent length distributions, with the documented bounded adaptation."""
+    patterns = {
+        "uniform512": [512] * 32,
+        "uniform4096": [4096] * 32,
+        "mixed": [128] * 16 + [4096] * 16,
+        "extreme": [64] * 15 + [16384],
+        "one64k7": [65536] + [4096] * 7,
+        "one64k15": [65536] + [4096] * 15,
+        "one64k31": [65536] + [4096] * 31,
+        "one128k31": [131072] + [4096] * 31,
+        "two32k30": [32768] * 2 + [4096] * 30,
+    }
+    configs = [
+        (32, 1, 6, 1, tuple(patterns)),
+        (16, 2, 4, 2, ("uniform512", "uniform4096", "extreme", "one64k7")),
+        (32, 4, 6, 3, ("uniform512", "uniform4096", "extreme", "one64k7")),
+        (64, 8, 8, 5, ("uniform512", "uniform4096", "extreme", "one64k7")),
+        (32, 4, 4, 4, ("one64k7",)),
+    ]
+    return [
+        dict(
+            case_id=f"p{page}_h{heads}_r{ratio}_t{tokens}_{pattern}",
+            pattern=pattern,
+            lengths=patterns[pattern],
+            page_size=page,
+            num_kv_heads=heads,
+            head_group_ratio=ratio,
+            q_len_per_req=tokens,
+        )
+        for page, heads, ratio, tokens, names in configs
+        for pattern in names
+    ]
+
+
+def atomic_json(target, value):
+    temporary = target.with_suffix(target.suffix + ".partial")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(target)
+
+
+def run_suite(args):
+    """Finite single-attention suite; completed matching cases can be resumed."""
+    target = Path(args.output_json)
+    configuration = dict(
+        suite=args.suite,
+        layers=1,
+        mode="persistent",
+        planner="gpu",
+        device=str(args.device),
+        seed=args.seed,
+        warmups=5,
+        samples=20,
+        cuda_graph=True,
+        cupti=False,
+        cold_l2_cache=False,
+        cases=suite_cases(),
+    )
+    state = dict(configuration=configuration, complete=False, records=[], failures=[])
+    if target.exists():
+        if not args.resume:
+            raise FileExistsError("Use --resume to retain completed suite cases")
+        state = json.loads(target.read_text())
+        if state["configuration"] != configuration:
+            raise ValueError("Existing suite configuration differs; use a new output")
+    completed = {record["case_id"] for record in state["records"]}
+    atomic_json(target, state)
+    for case in configuration["cases"]:
+        if case["case_id"] in completed:
+            print(dict(case_id=case["case_id"], state="resumed_complete"), flush=True)
+            continue
+        print(dict(case_id=case["case_id"], state="starting"), flush=True)
+        case_args = copy.copy(args)
+        for key in ("page_size", "num_kv_heads", "head_group_ratio", "q_len_per_req"):
+            setattr(case_args, key, case[key])
+        try:
+            result = run_case(
+                case_args, case["lengths"], max(case["lengths"]), suite=True
+            )
+        except Exception as error:
+            state["failures"].append(dict(case_id=case["case_id"], error=repr(error)))
+            atomic_json(target, state)
+            raise
+        state["records"].append(dict(case_id=case["case_id"], **result))
+        atomic_json(target, state)
+        print(dict(case_id=case["case_id"], state="complete"), flush=True)
+    state["complete"] = True
+    atomic_json(target, state)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lengths", default="131072,4096,4096,4096")
     parser.add_argument("--layers", type=int, default=2)
@@ -269,14 +360,30 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--compare-planners", action="store_true")
     parser.add_argument("--output-json")
+    parser.add_argument("--suite", choices=("tencent22",))
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--diagnose",
         action="store_true",
         help="Time planner and compute windows separately",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.num_kv_heads < 1:
         parser.error("--num-kv-heads must be positive")
+    if args.suite:
+        if (
+            args.layers != 1
+            or args.mode != "persistent"
+            or not args.output_json
+            or args.compare_planners
+            or args.diagnose
+            or args.capacity_length is not None
+        ):
+            parser.error("Suite requires --layers 1, persistent mode and --output-json")
+        run_suite(args)
+        return
+    if args.resume:
+        parser.error("--resume requires --suite")
     if args.compare_planners:
         if args.layers < 1:
             parser.error("Use at least one layer")
@@ -295,6 +402,10 @@ def main():
     capacity = max(lengths) if args.capacity_length is None else args.capacity_length
     if capacity < max(lengths):
         parser.error("--capacity-length must cover every live length")
+    return run_case(args, lengths, capacity)
+
+
+def run_case(args, lengths, capacity, *, suite=False):
     device = torch.device(args.device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -413,25 +524,26 @@ def main():
                 raise RuntimeError("Module output/counter check failed")
         return errors
 
-    check_outputs()
-    print(
-        dict(
-            device=str(device),
-            lengths=lengths,
-            layers=args.layers,
-            mode=args.mode,
-            seed=args.seed,
-            resources=plan.resources,
-            capacity_length=width * args.page_size,
-            page_size=args.page_size,
-            num_kv_heads=args.num_kv_heads,
-            head_group_ratio=args.head_group_ratio,
-            q_len_per_req=args.q_len_per_req,
-            groups=plan.num_groups,
-            direct=plan.direct,
-            assignment_per_window=0 if plan.direct else 1,
-        ),
-        flush=True,
+    errors_before = check_outputs()
+    configuration = dict(
+        device=str(device),
+        lengths=lengths,
+        layers=args.layers,
+        mode=args.mode,
+        seed=args.seed,
+        resources=plan.resources,
+        capacity_length=width * args.page_size,
+        page_size=args.page_size,
+        num_kv_heads=args.num_kv_heads,
+        head_group_ratio=args.head_group_ratio,
+        q_len_per_req=args.q_len_per_req,
+        groups=plan.num_groups,
+        direct=plan.direct,
+        assignment_per_window=0 if plan.direct else 1,
+    )
+    print(configuration, flush=True)
+    result = dict(
+        configuration=configuration, arms=[], relative_rms_before=errors_before
     )
     if args.diagnose:
         if plan.direct:
@@ -519,7 +631,7 @@ def main():
             ),
             flush=True,
         )
-    if args.benchmark or args.diagnose:
+    if args.benchmark or args.diagnose or suite:
         # Warm both and bracket the candidate with native; report absolute samples.
         windows = (
             ("native_before", native),
@@ -535,6 +647,13 @@ def main():
                 ("assign_and_compute", candidate),
                 ("native_after", native),
             )
+        elif suite:
+            windows = (
+                ("native_before", native),
+                ("compute_only", compute),
+                *(() if plan.direct else (("assign_and_compute", candidate),)),
+                ("native_after", native),
+            )
         for label, call in windows:
             times = bench_gpu_time(
                 call,
@@ -544,19 +663,29 @@ def main():
                 dry_run_iters=5,
                 repeat_iters=20,
             )
-            print(
-                dict(
-                    arm=label,
-                    median_window_us=1000 * statistics.median(times),
-                    samples_window_us=[1000 * t for t in times],
-                ),
-                flush=True,
+            record = dict(
+                arm=label,
+                median_window_us=1000 * statistics.median(times),
+                samples_window_us=[1000 * t for t in times],
             )
+            result["arms"].append(record)
+            print(record, flush=True)
+            if suite and plan.direct and label == "compute_only":
+                identical = dict(record, arm="assign_and_compute", same_window_as=label)
+                result["arms"].append(identical)
+                print(identical, flush=True)
         if args.diagnose:
             print(
                 dict(diagnostic_relative_rms=check_outputs(), counters_reset=True),
                 flush=True,
             )
+    result.update(relative_rms_after=check_outputs(), counters_reset=True)
+    if suite:
+        print(
+            dict(relative_rms_after=result["relative_rms_after"], counters_reset=True),
+            flush=True,
+        )
+    return result
 
 
 if __name__ == "__main__":

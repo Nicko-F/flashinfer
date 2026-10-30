@@ -63,4 +63,8 @@ do not force it to match the candidate's16-row tile.
   rerunning completed cases. The existing bounded experiment launcher controls
   timeout, heartbeat, memory floor and ownership.
 
-Status: planned stage-final protocol; results must be added only after execution.
+Status: completed once in `flashinfer-buckets-suite-20261030T170455Z`, with all22
+case output/counter checks passing and no retries or post-result kernel tuning.
+Seventeen full-window medians are faster, five regress; the largest relative RMS
+error is0.004230 and maximum native bracket drift is0.84%. Full results and
+limitations are in the [module report](../flashinfer/experimental/xqa_decode_buckets/README.md#stage-final-single-attention-matrix-2026-10-30-utc).

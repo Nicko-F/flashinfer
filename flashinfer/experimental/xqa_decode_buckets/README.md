@@ -29,7 +29,7 @@ an issue nor a target release is claimed by this preparation patch.
   Native page/token byte strides are retained; the packed head is contiguous.
 - Contiguous CUDA int32 page table `[B,width]` and sequence lengths `[B]`.
 - Independent finite effective BMM1 (QK) and BMM2 (V/output) scales.
-- No sinks, sliding windows, soft caps, speculative rows, or FP8 output.
+- No sinks, sliding windows, soft caps, ragged queries, tree masks, or FP8 output.
 
 Lengths include the full T-token suffix: each is zero for a padded request or
 at least T, and no larger than `width * page_size`. Query row t sees keys before
@@ -452,7 +452,8 @@ in 178.518 seconds. The 128 new replay subcases cover H=1/2/4/8 and ratios4/6/8
 at page32 with both planners, modes and cache layouts, plus direct and page16/64
 anchors. Head-distinct scales, padded head strides, per-head 3% output tolerance,
 changed lengths/page IDs, zero/restore and scratch/counter canaries all passed.
-The original default and page regression groups remain. Multi-query is pending.
+The original default and page regression groups remain. Multi-query was pending
+at this checkpoint.
 
 Nineteen compiled specializations reported zero spill loads/stores. Every
 observed runtime resource tuple retained 70,272 shared bytes and one resident
@@ -521,3 +522,89 @@ rows; extra row groups can reread KV compared with native default tiling.
 The results do not establish universal multi-query speedup, completed-wall host
 planning performance or model/serving latency. The stage-final workload matrix
 and framework integration remain separate work; no model MTP path is enabled.
+
+## Stage-final single-attention matrix (2026-10-30 UTC)
+
+The finite suite completed all 22 cases once, using the fixed multi-query
+implementation published at `ec05ef44bb2683d3e6e28d0531f085db177150ad`.
+Every case passed the existing 3% output tolerance before and after timing and
+reset its counters. The largest measured relative RMS error was 0.004230.
+No kernels or thresholds were tuned after measuring these cases.
+
+The nine length distributions follow the Tencent HPC-Ops workload cited in
+[`docs/benchmark_protocol.md`](../../../docs/benchmark_protocol.md); its three
+B64 distributions are adapted to B32. Precision, dimension and configuration
+follow this backend's contract. This is workload reuse, not a Tencent kernel
+measurement. P/H/R/T below denotes page size, KV heads, Q/KV ratio and query
+tokens per request. The protocol document spells out every pattern's lengths.
+
+These are one-attention GPU Graph medians on RTX 5090 physical GPU0 with NUMA0
+CPU affinity, seed0 and static exact device lengths. FlashInfer's existing
+helper uses five warmups and twenty samples per arm, CUPTI off and cold-L2
+handling off. This differs from Tencent's default fifty event-timed replay
+samples. Allocation and JIT are excluded. Native retains its default dispatch
+and receives the same operands, geometry and causal mask. Native controls
+bracket compute-only and full candidate windows. Speedup divides the mean of
+the native medians by the full candidate median; values below 1 are regressions.
+
+| P/H/R/T | Pattern | Native before / after (us) | Compute only (us) | Assign + compute (us) | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| P32/H1/R6/T1 | uniform512 | 12.048 / 12.048 | 12.253 | 12.253 | 0.98x |
+| P32/H1/R6/T1 | uniform4096 | 32.323 / 32.323 | 31.914 | 38.467 | 0.84x |
+| P32/H1/R6/T1 | mixed | 31.299 / 31.299 | 20.240 | 28.125 | 1.11x |
+| P32/H1/R6/T1 | extreme | 48.912 / 49.014 | 21.878 | 26.179 | 1.87x |
+| P32/H1/R6/T1 | one64k7 | 86.813 / 86.771 | 37.648 | 40.717 | 2.13x |
+| P32/H1/R6/T1 | one64k15 | 163.035 / 163.008 | 38.058 | 42.478 | 3.84x |
+| P32/H1/R6/T1 | one64k31 | 315.254 / 315.509 | 45.067 | 51.984 | 6.07x |
+| P32/H1/R6/T1 | one128k31 | 618.355 / 618.563 | 57.306 | 64.474 | 9.59x |
+| P32/H1/R6/T1 | two32k30 | 162.626 / 163.088 | 44.557 | 52.106 | 3.13x |
+| P16/H2/R4/T2 | uniform512 | 19.011 / 19.011 | 15.120 | 15.120 | 1.26x |
+| P16/H2/R4/T2 | uniform4096 | 81.680 / 81.885 | 78.506 | 80.451 | 1.02x |
+| P16/H2/R4/T2 | extreme | 123.510 / 122.894 | 26.384 | 31.504 | 3.91x |
+| P16/H2/R4/T2 | one64k7 | 236.150 / 236.611 | 63.690 | 63.614 | 3.72x |
+| P32/H4/R6/T3 | uniform512 | 24.336 / 24.541 | 36.829 | 43.997 | 0.56x |
+| P32/H4/R6/T3 | uniform4096 | 161.056 / 161.091 | 231.283 | 239.171 | 0.67x |
+| P32/H4/R6/T3 | extreme | 278.030 / 278.338 | 38.813 | 43.178 | 6.44x |
+| P32/H4/R6/T3 | one64k7 | 480.835 / 480.682 | 208.042 | 213.674 | 2.25x |
+| P64/H8/R8/T5 | uniform512 | 89.770 / 89.870 | 86.186 | 92.925 | 0.97x |
+| P64/H8/R8/T5 | uniform4096 | 610.627 / 611.699 | 589.840 | 605.043 | 1.01x |
+| P64/H8/R8/T5 | extreme | 557.021 / 556.507 | 105.898 | 110.301 | 5.05x |
+| P64/H8/R8/T5 | one64k7 | 1131.075 / 1131.280 | 623.274 | 625.117 | 1.81x |
+| P32/H4/R4/T4 | one64k7 | 480.237 / 481.446 | 84.494 | 89.768 | 5.36x |
+
+The uniform512 H1/T1 and H2/T2 cases use direct plans: compute-only and full
+are the same measured operation, recorded once with no Assign. Every other
+full window includes one GPU Assign. Independently timed components are not
+assumed additive; small inversions between compute-only and full medians are
+retained. Maximum native-before/after median drift was 0.84%.
+
+Five full windows regress, including both balanced H4/R6/T3 cases. Gains span
+0.56x-9.59x over this representative suite. Separate query-row groups can reread
+KV; the fixed 16-row resource choice does not promise a gain on balanced work.
+These measurements do not isolate each cause of a regression. All observed
+candidate runtime resources retain 70,272 shared bytes and one CTA per SM;
+unchanged kernels reuse the prior qualification's zero-spill compiler evidence.
+Previous two-layer anchors above remain separate results. This suite establishes
+neither Host completed-wall cost nor model, framework or serving speedup.
+
+The balanced T3/R6 regressions already appear in compute: uniform512 takes
+36.829 us versus the 24.438 us native mean, and uniform4096 takes 231.283 us
+versus 161.074 us, before Assign is included. Eighteen logical query/head rows
+use two candidate M16 row groups, while native generic M32 handles them in one.
+The resulting extra KV reads and row-group overhead are likely contributors,
+based on source mapping and timing; this is not a complete profiling attribution.
+For q1 uniform4096, compute-only is 31.914 us versus native's 32.323 us, but the
+38.467 us full window erases that small gain. Planning-window cost matters there.
+All planned module cases are complete; these regressions rule out a universal
+non-regression claim. Dispatch and tile tuning are not part of this stage.
+
+Run the same finite suite with:
+
+```bash
+python examples/xqa_decode_buckets.py --suite tencent22 --layers 1 --output-json results.json
+```
+
+The JSON records raw samples, output errors, counters and resources after each
+completed case using atomic replacement. Add `--resume` to skip completed cases
+with matching suite configuration; use a new output file when configuration
+changes. Failed case records are preserved in the failure list.

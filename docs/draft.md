@@ -25,8 +25,9 @@ Live lengths can still change on Graph replay.
 Page16/32/64 support is validated. The implementation also supports local KV head count,
 Q/KV ratios4/6/8 and uniform query lengths1–5 while retaining head dimension256,
 BF16 Q/output, packed NVFP4 cache and E4M3 block scales, with batch1–32.
-The experimental README records focused GPU validation and bounded timing
-anchors. The broader representative performance matrix is still pending.
+The experimental README records focused GPU validation, bounded timing anchors
+and the completed22-case representative matrix. Five full-window regressions
+remain, so support for a configuration does not imply a speedup.
 
 Let G be the number of independent head/query-row groups. For q1, G equals the
 KV head count. Multi-query uses G=KV_heads*ceil(query_length*ratio/16). A group
