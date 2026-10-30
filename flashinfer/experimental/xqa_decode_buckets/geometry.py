@@ -5,6 +5,22 @@ TILE = 256
 MAX_BATCH = 32
 MAX_CTAS = (1 << 31) - 1 - MAX_BATCH
 PAGE_SIZES = (16, 32, 64)
+HEAD_GROUP_RATIOS = (4, 6, 8)
+
+
+def check_head_config(num_kv_heads: int = 1, head_group_ratio: int = 6) -> None:
+    if type(num_kv_heads) is not int or not 1 <= num_kv_heads <= (1 << 31) - 1:
+        raise ValueError("num_kv_heads must be a bounded positive integer")
+    if type(head_group_ratio) is not int or head_group_ratio not in HEAD_GROUP_RATIOS:
+        raise ValueError("head_group_ratio must be 4, 6 or 8")
+
+
+def workspace_capacity(batch, ctas, table_width, page_size=32, num_kv_heads=1):
+    check_head_config(num_kv_heads)
+    capacity = plan_capacity(batch, ctas, table_width, page_size) * num_kv_heads
+    if capacity > (1 << 31) - 1:
+        raise ValueError("Total native scratch slots must fit int32")
+    return capacity
 
 
 def max_table_width(page_size: int = 32) -> int:
@@ -33,14 +49,22 @@ def plan_capacity(batch: int, ctas: int, table_width: int, page_size: int = 32) 
 
 
 def plan_geometry(
-    batch: int, table_width: int, sm_count: int, page_size: int = 32
+    batch: int,
+    table_width: int,
+    sm_count: int,
+    page_size: int = 32,
+    num_kv_heads: int = 1,
 ) -> tuple[int, bool]:
     """Return checked CTA capacity and static direct-path eligibility."""
     plan_capacity(batch, batch, table_width, page_size)
     if type(sm_count) is not int or not 1 <= sm_count <= MAX_CTAS:
         raise ValueError("Expected a bounded positive integer SM count")
+    check_head_config(num_kv_heads)
+    if batch * num_kv_heads > (1 << 31) - 1:
+        raise ValueError("Request/head counters must fit int32")
     # All inputs were checked before products or rounding. Live lengths stay
     # on device; a wide reserved table may therefore retain a larger grid.
     tiles_per_request = (table_width * page_size + TILE - 1) // TILE
     total_tiles = batch * tiles_per_request
-    return max(batch, min(sm_count, total_tiles)), batch == 1 or total_tiles <= sm_count
+    budget = max(1, (sm_count + num_kv_heads - 1) // num_kv_heads)
+    return max(batch, min(budget, total_tiles)), batch == 1 or total_tiles <= budget

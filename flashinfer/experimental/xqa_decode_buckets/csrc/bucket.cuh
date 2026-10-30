@@ -6,7 +6,7 @@
 #include <cstdint>
 #include "host_plan.h"
 struct XQATaskContext {
-  uint32_t request, slot, begin_tile, end_tile;
+  uint32_t request, head_group, slot, begin_tile, end_tile;
   uint32_t partial_begin, partial_count, total_slots;
   float qk_scale, v_scale;
   uint32_t reuse_barriers;
@@ -36,16 +36,17 @@ struct ComputeParams {
   int* semaphores;
   uint8_t* scratch;
   __nv_bfloat16* output;
-  int table_width;
-  int64_t kv_page, kv_token, sf_page, sf_token;
+  int table_width, kv_heads;
+  int64_t kv_page, kv_token, kv_head, sf_page, sf_token, sf_head;
   float qscale, vscale;
 };
 
 static_assert(ctaSize == 256 && ctaShapeInWarps.x == 4 && ctaShapeInWarps.y == 1 &&
               ctaShapeInWarps.z == 2 && grpLoadV && nbVBuffers == 2 &&
               gemm1NbWarpGrps == 1 && nbHeadSplits == 1 && headElems == 256 &&
-              headGrpSize == 6 && SPEC_DEC == 0 && BEAM_WIDTH == 1 && USE_CUSTOM_BARRIER == 1,
-              "Task/barrier ownership supports only the declared q1/Q6/KV1/D256 core");
+              (headGrpSize == 4 || headGrpSize == 6 || headGrpSize == 8) && warpTile.y == 16 &&
+              SPEC_DEC == 0 && BEAM_WIDTH == 1 && USE_CUSTOM_BARRIER == 1,
+              "Task/barrier ownership supports the declared q1/R4,R6,R8/D256 core");
 static_assert(ctaTile.x == Tile);
 static_assert((tokensPerPage == 16 || tokensPerPage == 32 || tokensPerPage == 64) &&
               Tile % tokensPerPage == 0, "Supported page sizes must divide the KV tile");
@@ -130,17 +131,19 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
   acqBulk();  // Before every task, header or live-length read.
 #endif
   auto const& plan = p.plan;
-  int tid = threadIdx.x + 128 * threadIdx.z, owner = blockIdx.x;
+  int tid = threadIdx.x + 128 * threadIdx.z, owner = blockIdx.x, group = blockIdx.y;
 #if FLASHINFER_XQA_DIRECT_TASKS
   int request = blockIdx.z;
   if (owner == 0 && plan.lengths[request] == 0) {
-    for (int i = tid; i < 6 * 256; i += 256) p.output[request * 6 * 256 + i] = __float2bfloat16_rn(0.f);
-    if (tid == 0) p.semaphores[request] = 0;
+    for (int i = tid; i < headGrpSize * 256; i += 256)
+      p.output[(uint64_t(request) * p.kv_heads + group) * headGrpSize * 256 + i] = __float2bfloat16_rn(0.f);
+    if (tid == 0) p.semaphores[request * p.kv_heads + group] = 0;
   }
 #else
   if (owner < plan.batch && plan.lengths[owner] == 0) {
-    for (int i = tid; i < 6 * 256; i += 256) p.output[owner * 6 * 256 + i] = __float2bfloat16_rn(0.f);
-    if (tid == 0) p.semaphores[owner] = 0;
+    for (int i = tid; i < headGrpSize * 256; i += 256)
+      p.output[(uint64_t(owner) * p.kv_heads + group) * headGrpSize * 256 + i] = __float2bfloat16_rn(0.f);
+    if (tid == 0) p.semaphores[owner * p.kv_heads + group] = 0;
   }
 #endif
 #if FLASHINFER_XQA_DIRECT_TASKS
@@ -169,9 +172,12 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
     XQABucketRange range = plan.requests[task.request];
     int total_slots = plan.header[1];
 #endif
-    XQATaskContext context{uint32_t(task.request), uint32_t(slot), uint32_t(task.begin),
-        uint32_t(task.end), uint32_t(range.begin), uint32_t(range.count),
-        uint32_t(total_slots), p.qscale, p.vscale,
+    // Every group shares descriptors but owns a compact, disjoint live scratch
+    // interval. The H=1 layout is exactly the original layout.
+    int group_base = group * total_slots;
+    XQATaskContext context{uint32_t(task.request), uint32_t(group), uint32_t(group_base + slot),
+        uint32_t(task.begin), uint32_t(task.end), uint32_t(group_base + range.begin),
+        uint32_t(range.count), uint32_t(total_slots * p.kv_heads), p.qscale, p.vscale,
 #if FLASHINFER_XQA_PERSISTENT_TASKS
         uint32_t(reused)
 #else
@@ -184,10 +190,12 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
         reinterpret_cast<GMemCacheHeadSf*>(const_cast<uint8_t*>(p.vs)),
         reinterpret_cast<const KVCachePageIndex*>(p.table),
         reinterpret_cast<const uint32_t*>(plan.lengths), uint32_t(p.table_width)};
-    kernel_mha_impl(context, 1, 1.f, nullptr, reinterpret_cast<OutputHead*>(p.output),
+    kernel_mha_impl(context, p.kv_heads, 1.f, nullptr, reinterpret_cast<OutputHead*>(p.output),
         reinterpret_cast<const IOHead*>(p.q), nullptr, cache, plan.batch, 1.f, nullptr,
-        uint32_t(p.kv_page / sizeof(GMemCacheHead)), uint32_t(p.kv_token / sizeof(GMemCacheHead)), 1,
-        uint32_t(p.sf_page / sizeof(GMemCacheHeadSf)), uint32_t(p.sf_token / sizeof(GMemCacheHeadSf)), 1,
+        uint32_t(p.kv_page / sizeof(GMemCacheHead)), uint32_t(p.kv_token / sizeof(GMemCacheHead)),
+        uint32_t(p.kv_head / sizeof(GMemCacheHead)),
+        uint32_t(p.sf_page / sizeof(GMemCacheHeadSf)), uint32_t(p.sf_token / sizeof(GMemCacheHeadSf)),
+        uint32_t(p.sf_head / sizeof(GMemCacheHeadSf)),
         reinterpret_cast<uint32_t*>(p.semaphores), p.scratch);
 #if FLASHINFER_XQA_PERSISTENT_TASKS
     // Join every producer/consumer before the next task reinitializes barriers.

@@ -1629,7 +1629,7 @@ CUBIN_EXPORT __global__
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
 #if FLASHINFER_XQA_TASKS
-  uint32_t const idxHeadGrp = 0;
+  uint32_t const idxHeadGrp = task.head_group;
 #else
   uint32_t const idxHeadGrp = blockIdx.y;  // inside one request
 #endif

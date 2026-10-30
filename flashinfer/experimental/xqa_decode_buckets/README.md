@@ -21,9 +21,10 @@ an issue nor a target release is claimed by this preparation patch.
 ## Supported inputs
 
 - SM120; one query token per request, `1 <= B <= 32`.
-- Contiguous BF16 Q/output `[B,6,256]`; one local KV head.
-- Packed NVFP4 K/V `[pages,page_size,1,128]`, E4M3 block scales
-  `[pages,page_size,1,16]`, NHD, with `page_size` in `{16,32,64}` (default 32).
+- Contiguous BF16 Q/output `[B,H*R,256]`, with positive `H=num_kv_heads`
+  (default 1) and `R=head_group_ratio` in `{4,6,8}` (default 6).
+- Packed NVFP4 K/V `[pages,page_size,H,128]`, E4M3 block scales
+  `[pages,page_size,H,16]`, NHD, with `page_size` in `{16,32,64}` (default 32).
   Native page/token byte strides are retained; the packed head is contiguous.
 - Contiguous CUDA int32 page table `[B,width]` and sequence lengths `[B]`.
 - Independent finite effective BMM1 (QK) and BMM2 (V/output) scales.
@@ -37,11 +38,15 @@ them. Zero-length rows produce zero output.
 There is no model, TP degree, layer count, run-directory or configured 128K
 requirement. Width is bounded by `(INT32_MAX - 255) // page_size`: this keeps padded tile
 ends and all 32 dense table rows representable. CTA count is
-`max(B, min(SMs, B * ceil(width * page_size / 256)))`, with at least B CTAs for zero-row
+`C = max(B, min(ceil(SMs/H), B * ceil(width * page_size / 256)))` per head group,
+with at least B CTAs for zero-row
 owners. This uses static table capacity, not a device-to-host length read. A wide
 reserved table can retain a full grid even when its live prefix is short.
-Compact task capacity
-is `CTAs + B - 1`, the intersection bound for two interval partitions. Native
+Compact descriptor capacity is `C + B - 1`, the intersection bound for two
+interval partitions, shared across heads. Native scratch capacity is at most
+`H * (C + B - 1)` slots. Total slots/counters must fit int32, and native query
+head/cache offsets must fit uint32. The factory checks the actual device grid-Y
+limit once, outside capture, and retains it in the plan. Native
 scratch is sized using 64-bit host arithmetic and rejected if its byte extent
 would exceed native `MemSegmenter`'s uint32 offsets. No fixed GPU SM-count limit
 is imposed.
@@ -65,12 +70,12 @@ for q, k, v, ks, vs, out in compatible_attention_layers:
 ```
 
 The factory selects `plan.direct` when `B == 1` or
-`B * ceil(width * page_size / 256) <= SMs`. This is a static capacity condition, not a
+`B * ceil(width * page_size / 256) <= ceil(SMs/H)`. This is a static capacity condition, not a
 measured-length heuristic. Otherwise the initial factory call prepares one
 generation and `prepare()` refreshes task contents without replacing pointers.
 
 For direct plans, task/request/span/header tensors are deliberately empty and
-`prepare()` is a no-op. The grid is `(CTAs / B, 1, B)`; its Z coordinate identifies
+`prepare()` is a no-op. The grid is `(C / B, H, B)`; its Z coordinate identifies
 the request, with no task-table lookup. For B>1 each active CTA handles one tile,
 and request-local partial ranges reserve slots from the static per-request cap.
 For B=1, live splits can each cover multiple tiles for a long prefix; the merge
@@ -89,9 +94,23 @@ load-dependent routing policy.
 The optional factory argument `page_size=32` is retained in `plan.page_size` and
 selects a page-specific JIT/cache key and native `TOKENS_PER_PAGE` specialization.
 Page sizes 16, 32 and 64 divide the unchanged 256-token CTA tile. The descriptor
-ABI, ownership in token tiles, Q6/KV1/D256/q1 contract and native arithmetic are
+ABI, ownership in token tiles, D256/q1 contract and native arithmetic are
 unchanged. Cache views and the CPU host planner use the selected page capacity;
 both planners and both ownership modes support all three page sizes.
+
+The factory also accepts `num_kv_heads` and `head_group_ratio`. KV-head count is
+runtime metadata and does not multiply descriptor storage or assignment work;
+ratio selects its native JIT specialization. The prepared grid is `(C,H,1)`.
+Each head group reads the same request plan and uses its own cache head stride,
+Q/output head group and request counter `request * H + head`. Scratch slots are
+compact across groups: prepared stride is live `header[1]`, direct B1 stride is
+its live split count, and direct multi-request stride is C. The group offset is
+added to both each slot and its request's partial base. The native scratch
+segmenter receives the total live slot count across heads; allocation uses the
+checked maximum. H=1 preserves the original slot layout. Multiple groups can
+require more CTAs than SMs because each needs the existing zero-row owners.
+The same 16-row padded MMA tile and 256-thread warp layout support ratios4/6/8;
+resource reports must still be measured for each compiled specialization.
 
 Plans, workspace and referenced tensors must outlive every asynchronous consumer
 and captured Graph. Sequential layers may share scratch/counters after the prior
@@ -188,8 +207,8 @@ compatibility. Framework integration must validate its actual capture boundary.
 
 ## Initial module validation (2026-10-30, before the small-work fix)
 
-Historical measurements in the following sections use page size 32 unless
-another page size is explicitly stated.
+Historical measurements in the following sections use H=1/R=6 and page size32
+unless another configuration is explicitly stated.
 
 Source import, JIT and all six focused tests passed on an RTX 5090 (SM120),
 Torch 2.14.0+cu130 and CUDA 13. The tests include four changed-input Graph cases
@@ -396,3 +415,41 @@ Each timing was run once after qualification. These anchors establish page
 geometry support for this bounded q1 contract. Host-planner timing at the new
 page sizes, larger head configurations, multiple query tokens and model/service
 integration remain separate work.
+
+## KV-head and ratio expansion (2026-10-30 UTC)
+
+The shared-request-plan head expansion passed all fifteen focused test groups
+in 178.518 seconds. The 128 new replay subcases cover H=1/2/4/8 and ratios4/6/8
+at page32 with both planners, modes and cache layouts, plus direct and page16/64
+anchors. Head-distinct scales, padded head strides, per-head 3% output tolerance,
+changed lengths/page IDs, zero/restore and scratch/counter canaries all passed.
+The original default and page regression groups remain. Multi-query is pending.
+
+Nineteen compiled specializations reported zero spill loads/stores. Every
+observed runtime resource tuple retained 70,272 shared bytes and one resident
+CTA per SM. Page32 reports below include a 112-byte stack; they are measurements
+of this shared-group implementation, separate from the earlier page-slice table.
+
+| Ratio | Persistent registers | Aligned registers | Direct registers |
+| --- | ---: | ---: | ---: |
+| 4 | 206 | 191 | 180 |
+| 6 | 204 | 183 | 183 |
+| 8 | 206 | 191 | 191 |
+
+Three bounded page32 persistent timing anchors used RTX 5090 physical GPU0/NUMA0
+CPU affinity, seed0, two layers and lengths `65536 + 7 x 4096`. Inputs were shared
+with their same-geometry native controls. Each row is one run with five warmups
+and twenty samples, CUDA Graph timing, CUPTI off and cold-L2 handling off. Units
+are microseconds. The candidate includes one GPU Assign per two-layer window;
+allocation and JIT are outside timing. Native controls bracket each candidate.
+
+| KV heads | Ratio | Native before | Native after | Persistent candidate |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 6 | 727.422 | 730.126 | 181.571 |
+| 2 | 4 | 369.678 | 371.062 | 106.358 |
+| 8 | 8 | 1879.414 | 1885.202 | 532.701 |
+
+These are bounded q1 GPU Graph anchors, not full configuration curves or model
+and serving latency. Host planning remains available and correctness-tested;
+new-head completed-wall Host timing and the stage-final matrix remain separate
+work. No per-change gain attribution or universal non-regression is implied.

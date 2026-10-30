@@ -71,6 +71,8 @@ def compare_planners(args):
                 lens,
                 page_table_width=width,
                 page_size=args.page_size,
+                num_kv_heads=args.num_kv_heads,
+                head_group_ratio=args.head_group_ratio,
                 mode=args.mode,
                 planner=planner,
                 host_seq_lens=cpu_lengths if planner == "host" else None,
@@ -80,14 +82,18 @@ def compare_planners(args):
         bank = []
         for _ in range(args.layers):
             q = (
-                torch.randn((batch, 6, 256), dtype=torch.bfloat16, device=args.device)
+                torch.randn(
+                    (batch, args.num_kv_heads * args.head_group_ratio, 256),
+                    dtype=torch.bfloat16,
+                    device=args.device,
+                )
                 * 0.25
             )
             kv = [
                 torch.randint(
                     0,
                     256,
-                    (pages, args.page_size, 1, 128),
+                    (pages, args.page_size, args.num_kv_heads, 128),
                     dtype=torch.uint8,
                     device=args.device,
                 )
@@ -95,7 +101,7 @@ def compare_planners(args):
             ]
             sf = [
                 torch.ones(
-                    (pages, args.page_size, 1, 16),
+                    (pages, args.page_size, args.num_kv_heads, 16),
                     dtype=torch.float8_e4m3fn,
                     device=args.device,
                 )
@@ -158,7 +164,10 @@ def compare_planners(args):
         host = plans["host"]
         if not host.direct:
             module, _ = get_module(
-                args.mode == "persistent", lens.device, page_size=args.page_size
+                args.mode == "persistent",
+                lens.device,
+                page_size=args.page_size,
+                head_group_ratio=args.head_group_ratio,
             )
             staging = torch.empty_like(host._host_descriptors, pin_memory=True)
             fill = lambda: module.plan_host(
@@ -191,6 +200,8 @@ def compare_planners(args):
                 raise RuntimeError("Counter reset check failed")
         record = dict(
             scenario=label,
+            num_kv_heads=args.num_kv_heads,
+            head_group_ratio=args.head_group_ratio,
             page_size=args.page_size,
             lengths=lengths,
             layers=args.layers,
@@ -230,6 +241,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--page-size", type=int, choices=(16, 32, 64), default=32)
+    parser.add_argument("--num-kv-heads", type=int, default=1)
+    parser.add_argument("--head-group-ratio", type=int, choices=(4, 6, 8), default=6)
     parser.add_argument(
         "--capacity-length", type=int, help="Reserved table capacity in tokens"
     )
@@ -245,6 +258,8 @@ def main():
         help="Time planner and compute windows separately",
     )
     args = parser.parse_args()
+    if args.num_kv_heads < 1:
+        parser.error("--num-kv-heads must be positive")
     if args.compare_planners:
         if args.layers < 1:
             parser.error("Use at least one layer")
@@ -275,19 +290,28 @@ def main():
         offset += count
     lens = torch.tensor(lengths, dtype=torch.int32, device=device)
     plan = create_xqa_decode_bucket_plan(
-        lens, page_table_width=width, page_size=args.page_size, mode=args.mode
+        lens,
+        page_table_width=width,
+        page_size=args.page_size,
+        mode=args.mode,
+        num_kv_heads=args.num_kv_heads,
+        head_group_ratio=args.head_group_ratio,
     )
     bank = []
     for _ in range(args.layers):
         q = (
-            torch.randn((len(lengths), 6, 256), dtype=torch.bfloat16, device=device)
+            torch.randn(
+                (len(lengths), args.num_kv_heads * args.head_group_ratio, 256),
+                dtype=torch.bfloat16,
+                device=device,
+            )
             * 0.25
         )
         k, v = [
             torch.randint(
                 0,
                 256,
-                (offset, args.page_size, 1, 128),
+                (offset, args.page_size, args.num_kv_heads, 128),
                 dtype=torch.uint8,
                 device=device,
             )
@@ -295,7 +319,7 @@ def main():
         ]
         ks, vs = [
             torch.ones(
-                (offset, args.page_size, 1, 16),
+                (offset, args.page_size, args.num_kv_heads, 16),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
@@ -371,6 +395,8 @@ def main():
             resources=plan.resources,
             capacity_length=width * args.page_size,
             page_size=args.page_size,
+            num_kv_heads=args.num_kv_heads,
+            head_group_ratio=args.head_group_ratio,
             direct=plan.direct,
             assignment_per_window=0 if plan.direct else 1,
         ),
@@ -390,9 +416,11 @@ def main():
                     dict(
                         request=request,
                         live_length=live,
-                        partial_begin=base,
+                        partial_begin_group0=base,
                         partial_count=parts,
-                        total_slots=parts if len(live_lengths) == 1 else plan.ctas,
+                        group_stride=parts if len(live_lengths) == 1 else plan.ctas,
+                        total_slots=(parts if len(live_lengths) == 1 else plan.ctas)
+                        * args.num_kv_heads,
                         intervals=[
                             [i * tiles // parts, (i + 1) * tiles // parts]
                             for i in range(parts)
@@ -403,11 +431,13 @@ def main():
                 source="derived from live device length outside timed region",
                 representation="direct_empty_descriptors",
                 request_bounds_derived=request_bounds,
-                grid=[per_request, 1, len(live_lengths)],
-                grid_ctas=plan.ctas,
+                grid=[per_request, args.num_kv_heads, len(live_lengths)],
+                ctas_per_group=plan.ctas,
+                grid_ctas=plan.ctas * args.num_kv_heads,
                 nonempty_tile_ctas_derived=sum(
                     r["partial_count"] for r in request_bounds
-                ),
+                )
+                * args.num_kv_heads,
             )
             print(
                 dict(
@@ -424,11 +454,15 @@ def main():
                 header=header,
                 tasks=plan.tasks[: header[1]].cpu().tolist(),
                 requests=plan.requests.cpu().tolist(),
-                grid_ctas=plan.ctas,
-                active_ctas=header[2],
+                grid_ctas=plan.ctas * args.num_kv_heads,
+                ctas_per_group=plan.ctas,
+                active_ctas=header[2] * args.num_kv_heads,
             )
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-        splits = min(max(1, sms // len(lengths)), (width * args.page_size + 255) // 256)
+        splits = min(
+            max(1, sms // (len(lengths) * args.num_kv_heads)),
+            (width * args.page_size + 255) // 256,
+        )
         print(
             dict(
                 plan_topology=topology,
@@ -436,12 +470,13 @@ def main():
                     source="csrc/xqa/mha.cu:3211-3222",
                     formula="splits=min(max(1,SMs/(B*KVheads)),ceil(table_width*page_size/256))",
                     sm_count=sms,
-                    kv_heads=1,
-                    grid=[splits, 1, len(lengths)],
-                    grid_ctas=splits * len(lengths),
+                    kv_heads=args.num_kv_heads,
+                    grid=[splits, args.num_kv_heads, len(lengths)],
+                    grid_ctas=splits * len(lengths) * args.num_kv_heads,
                     nonempty_tile_ctas=sum(
                         min(splits, (n + 255) // 256) for n in lengths
-                    ),
+                    )
+                    * args.num_kv_heads,
                 ),
                 compute_math="native QK/PV; transposed compute is not implemented",
             ),

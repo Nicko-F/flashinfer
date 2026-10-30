@@ -43,6 +43,8 @@ def create_xqa_decode_bucket_plan(
     *,
     page_table_width: int,
     page_size: int = 32,
+    num_kv_heads: int = 1,
+    head_group_ratio: int = 6,
     mode: str = "persistent",
     planner: str = "gpu",
     host_seq_lens: Optional[torch.Tensor] = None,
@@ -56,7 +58,8 @@ def create_xqa_decode_bucket_plan(
     remain fixed. Call ``plan.prepare()`` once after updating lengths for each
     subsequent forward, before all attention layers sharing the request order.
     A direct plan is selected for ``B=1`` or when the static total tile bound
-    ``B * ceil(page_table_width * page_size / 256)`` fits the device SM count. For these
+    ``B * ceil(page_table_width * page_size / 256)`` fits the per-head CTA budget
+    defined below. For these
     plans ``prepare()`` is a no-op: compute derives contiguous boundaries from
     live device lengths. Both mode names select the same direct one-task-per-CTA
     path; its descriptor tensors are empty and no assignment kernel is launched.
@@ -80,6 +83,13 @@ def create_xqa_decode_bucket_plan(
     waits for its previous copy only if still in flight. Both planners preserve
     the direct-plan no-op and use identical compute and task ownership.
 
+    ``num_kv_heads`` is positive and checked against the device grid-Y limit
+    and native workspace/index bounds. ``head_group_ratio`` is 4, 6 (default),
+    or 8 query heads per KV head. All head groups share request descriptors.
+    Their CTA target is ``ceil(SMs / num_kv_heads)``, retaining at least B owners
+    per group; scratch and request counters are independent. Direct selection
+    uses this per-group budget in place of the single-group SM count above.
+
     This explicit call opts into the experimental SM120 backend. No model,
     TP degree, layer count or configured maximum context length is required.
     See ``flashinfer/experimental/xqa_decode_buckets/README.md`` for limits.
@@ -90,6 +100,8 @@ def create_xqa_decode_bucket_plan(
         seq_lens,
         page_table_width=page_table_width,
         page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_group_ratio=head_group_ratio,
         mode=mode,
         planner=planner,
         host_seq_lens=host_seq_lens,
@@ -114,9 +126,10 @@ def xqa_decode_with_buckets(
 ) -> torch.Tensor:
     """Run q1 native XQA math using an experimental work plan.
 
-    Supports SM120 BF16 Q/output ``[B,6,256]``, one local KV head, NHD
-    NVFP4 K/V ``[pages,plan.page_size,1,128]`` and E4M3 block scales
-    ``[pages,plan.page_size,1,16]``, with page size 16, 32 or 64.
+    Supports SM120 BF16 Q/output ``[B,H*R,256]``, with ``H=plan.num_kv_heads``
+    and ``R=plan.head_group_ratio``. NHD NVFP4 K/V is ``[pages,P,H,128]`` and
+    E4M3 block scales are ``[pages,P,H,16]``, with ``P=plan.page_size`` in
+    {16,32,64}. One query token is supported per request.
     Packed data and scale byte strides are retained.
     ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
     reached by live lengths must address allocated cache pages. Zero-length

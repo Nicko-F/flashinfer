@@ -14,7 +14,12 @@ from ...utils import (
     register_fake_op,
 )
 from .jit import get_module
-from .geometry import plan_capacity, plan_geometry
+from .geometry import (
+    check_head_config,
+    plan_capacity,
+    plan_geometry,
+    workspace_capacity,
+)
 
 
 def _tensor(tensor, name, *, dtype, shape, device, contiguous=True, alignment=1):
@@ -64,8 +69,14 @@ def _prepare(
     ctas: int,
     aligned: bool,
     page_size: int,
+    head_group_ratio: int,
 ) -> None:
-    module, _ = get_module(not aligned, lengths.device, page_size=page_size)
+    module, _ = get_module(
+        not aligned,
+        lengths.device,
+        page_size=page_size,
+        head_group_ratio=head_group_ratio,
+    )
     module.plan(lengths, tasks, requests, spans, header, ctas, aligned)
 
 
@@ -79,6 +90,7 @@ def _fake_prepare(
     ctas: int,
     aligned: bool,
     page_size: int,
+    head_group_ratio: int,
 ) -> None:
     pass
 
@@ -108,11 +120,16 @@ def _compute(
     bmm2_scale: float,
     enable_pdl: bool,
     page_size: int,
+    head_group_ratio: int,
 ) -> None:
     # Empty headers are the factory's explicit static direct-plan representation.
     direct = header.numel() == 0
     module, _ = get_module(
-        not aligned and not direct, q.device, direct=direct, page_size=page_size
+        not aligned and not direct,
+        q.device,
+        direct=direct,
+        page_size=page_size,
+        head_group_ratio=head_group_ratio,
     )
     module.run(
         q,
@@ -159,6 +176,7 @@ def _fake_compute(
     bmm2_scale: float,
     enable_pdl: bool,
     page_size: int,
+    head_group_ratio: int,
 ) -> None:
     pass
 
@@ -177,7 +195,7 @@ class BucketPlan:
 
     Direct plans use geometry inside compute; prepare() is a no-op and all four
     descriptor tensors are empty. They apply to B=1 or when the static table's
-    total tile bound fits the device SM count. Both mode names select the same
+    total tile bound fits the per-head CTA budget. Both mode names select the same
     one-task-per-CTA specialization for direct plans. Otherwise call prepare()
     once per forward after updating lengths, before its compute consumers.
     Compatible layers share the same request ordering and lengths. Replays and
@@ -199,6 +217,9 @@ class BucketPlan:
     ctas: int
     table_width: int
     page_size: int
+    num_kv_heads: int
+    head_group_ratio: int
+    grid_y_limit: int
     mode: str
     scratch_bytes: int
     resources: tuple
@@ -227,6 +248,7 @@ class BucketPlan:
                     self.mode == "persistent",
                     self.lengths.device,
                     page_size=self.page_size,
+                    head_group_ratio=self.head_group_ratio,
                 )
                 module.plan_host(
                     self.host_seq_lens,
@@ -249,6 +271,7 @@ class BucketPlan:
                 self.ctas,
                 self.mode == "aligned",
                 self.page_size,
+                self.head_group_ratio,
             )
         return self
 
@@ -259,7 +282,9 @@ class BucketPlan:
                 self.scratch_bytes, dtype=torch.uint8, device=self.lengths.device
             ),
             torch.zeros(
-                self.lengths.numel(), dtype=torch.int32, device=self.lengths.device
+                self.lengths.numel() * self.num_kv_heads,
+                dtype=torch.int32,
+                device=self.lengths.device,
             ),
         )
 
@@ -272,7 +297,10 @@ def create_plan(
     mode="persistent",
     planner="gpu",
     host_seq_lens=None,
+    num_kv_heads=1,
+    head_group_ratio=6,
 ):
+    check_head_config(num_kv_heads, head_group_ratio)
     if mode not in ("persistent", "aligned"):
         raise ValueError("mode must be persistent or aligned")
     if planner not in ("gpu", "host"):
@@ -291,12 +319,25 @@ def create_plan(
     elif host_seq_lens is not None:
         raise ValueError("host_seq_lens is only used with planner='host'")
     ctas, direct = plan_geometry(
-        batch, page_table_width, get_device_sm_count(device), page_size
+        batch, page_table_width, get_device_sm_count(device), page_size, num_kv_heads
     )
     capacity = plan_capacity(batch, ctas, page_table_width, page_size)
-    module, resources = get_module(
-        mode == "persistent" and not direct, device, direct=direct, page_size=page_size
+    total_capacity = workspace_capacity(
+        batch, ctas, page_table_width, page_size, num_kv_heads
     )
+    if batch * num_kv_heads * head_group_ratio > (1 << 32) - 1:
+        raise ValueError("Native query head indices must fit uint32")
+    module, resources = get_module(
+        mode == "persistent" and not direct,
+        device,
+        direct=direct,
+        page_size=page_size,
+        head_group_ratio=head_group_ratio,
+    )
+    grid_y_limit = module.grid_y_limit(device.index)
+    if num_kv_heads > grid_y_limit:
+        raise ValueError(f"num_kv_heads exceeds device grid-Y limit {grid_y_limit}")
+    scratch_bytes = module.scratch_bytes(total_capacity)
     host_descriptors = device_descriptors = copy_done = None
     if planner == "host" and not direct:
         words = 6 * (ctas + batch)
@@ -326,8 +367,11 @@ def create_plan(
         ctas,
         page_table_width,
         page_size,
+        num_kv_heads,
+        head_group_ratio,
+        grid_y_limit,
         mode,
-        module.scratch_bytes(capacity),
+        scratch_bytes,
         resources,
         direct,
         planner,
@@ -358,7 +402,7 @@ def run(
     if not isinstance(plan, BucketPlan) or not isinstance(workspace, BucketWorkspace):
         raise TypeError("Expected a bucket plan and its caller-owned workspace")
     device, batch = plan.lengths.device, plan.lengths.numel()
-    shape = (batch, 6, 256)
+    shape = (batch, plan.num_kv_heads * plan.head_group_ratio, 256)
     _tensor(
         query, "query", dtype=torch.bfloat16, shape=shape, device=device, alignment=16
     )
@@ -382,12 +426,12 @@ def run(
             value,
             name,
             dtype=dtype,
-            shape=(pages, plan.page_size, 1, width),
+            shape=(pages, plan.page_size, plan.num_kv_heads, width),
             device=device,
             contiguous=False,
             alignment=16,
         )
-        if value.stride(-1) != 1 or value.stride(0) % unit or value.stride(1) % unit:
+        if value.stride(-1) != 1 or any(value.stride(i) % unit for i in range(3)):
             raise ValueError(f"{name} must preserve native packed-head byte strides")
     if (
         k_cache.stride() != v_cache.stride()
@@ -406,7 +450,7 @@ def run(
         workspace.semaphores,
         "semaphores",
         dtype=torch.int32,
-        shape=(batch,),
+        shape=(batch * plan.num_kv_heads,),
         device=device,
     )
     if not all(math.isfinite(float(s)) for s in (bmm1_scale, bmm2_scale)):
@@ -445,5 +489,6 @@ def run(
             float(bmm2_scale),
             enable_pdl,
             plan.page_size,
+            plan.head_group_ratio,
         )
     return out

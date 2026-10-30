@@ -84,6 +84,12 @@ int64_t bucket_scratch_bytes(int64_t capacity) {
   return int64_t(size);
 }
 
+int64_t bucket_grid_y_limit(int64_t device_id) {
+  int limit = 0;
+  checkCuda(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxGridDimY, int(device_id)));
+  return limit;
+}
+
 void bucket_configure(TensorView resources) {
   CHECK_CPU(resources);
   CHECK_CONTIGUOUS(resources);
@@ -111,11 +117,15 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
   auto plan = plan_params(lengths, tasks, requests, spans, header, ctas, aligned);
   auto device = q.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
-  check_tensor(q, dl_bfloat16, device, plan.batch * 6 * 256);
+  CHECK_DIM(4, k);
+  int64_t heads = k.size(2), capacity = ctas + plan.batch - 1;
+  TVM_FFI_ICHECK(heads >= 1 && heads <= INT32_MAX / capacity);
+  TVM_FFI_ICHECK_LE(heads * plan.batch * headGrpSize, UINT32_MAX);
+  check_tensor(q, dl_bfloat16, device, plan.batch * heads * headGrpSize * 256);
   check_tensor(output, dl_bfloat16, device, q.numel());
   check_tensor(table, dl_int32, device, table.numel());
-  check_tensor(semaphores, dl_int32, device, plan.batch);
-  check_tensor(scratch, dl_uint8, device, bucket_scratch_bytes(ctas + plan.batch - 1));
+  check_tensor(semaphores, dl_int32, device, plan.batch * heads);
+  check_tensor(scratch, dl_uint8, device, bucket_scratch_bytes(capacity * heads));
   TVM_FFI_ICHECK_EQ(lengths.device().device_id, device.device_id);
   CHECK_DIM(2, table);
   TVM_FFI_ICHECK_EQ(table.size(0), plan.batch);
@@ -135,15 +145,29 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
     TVM_FFI_ICHECK_EQ(t.device().device_id, device.device_id);
     TVM_FFI_ICHECK_EQ(t.size(0), k.size(0));
     TVM_FFI_ICHECK_EQ(t.size(1), tokensPerPage);
-    TVM_FFI_ICHECK_EQ(t.size(2), 1);
+    TVM_FFI_ICHECK_EQ(t.size(2), heads);
   }
   CHECK_INPUT_TYPE(k, dl_uint8);
   CHECK_INPUT_TYPE(v, dl_uint8);
   CHECK_INPUT_TYPE(ks, dl_float8_e4m3fn);
   CHECK_INPUT_TYPE(vs, dl_float8_e4m3fn);
   TVM_FFI_ICHECK(k.size(3) == 128 && v.size(3) == 128 && ks.size(3) == 16 && vs.size(3) == 16);
+  for (auto t : {k, v, ks, vs}) {
+    int64_t unit = t.size(3);  // One packed/scaling head, in bytes.
+    uint64_t span = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+      TVM_FFI_ICHECK(t.stride(axis) >= 0 && t.stride(axis) % unit == 0);
+      TVM_FFI_ICHECK_LE(t.stride(axis) / unit, UINT32_MAX);
+      uint64_t steps = t.size(axis) ? t.size(axis) - 1 : 0;
+      uint64_t stride = t.stride(axis) / unit;
+      TVM_FFI_ICHECK(stride == 0 || steps <= (UINT32_MAX - span) / stride);
+      span += steps * stride;
+    }
+    TVM_FFI_ICHECK_LE(span, UINT32_MAX) << "Native cache head offsets must fit uint32";
+  }
   TVM_FFI_ICHECK(k.stride(0) == v.stride(0) && k.stride(1) == v.stride(1) &&
-                 ks.stride(0) == vs.stride(0) && ks.stride(1) == vs.stride(1));
+                 k.stride(2) == v.stride(2) && ks.stride(0) == vs.stride(0) &&
+                 ks.stride(1) == vs.stride(1) && ks.stride(2) == vs.stride(2));
   TVM_FFI_ICHECK(k.stride(0) % sizeof(GMemCacheHead) == 0 &&
                  k.stride(1) % sizeof(GMemCacheHead) == 0 &&
                  ks.stride(0) % sizeof(GMemCacheHeadSf) == 0 &&
@@ -154,12 +178,13 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
       static_cast<const uint8_t*>(ks.data_ptr()), static_cast<const uint8_t*>(vs.data_ptr()),
       static_cast<const int*>(table.data_ptr()), static_cast<int*>(semaphores.data_ptr()),
       static_cast<uint8_t*>(scratch.data_ptr()), static_cast<__nv_bfloat16*>(output.data_ptr()),
-      int(table.size(1)), k.stride(0), k.stride(1), ks.stride(0), ks.stride(1),
+      int(table.size(1)), int(heads), k.stride(0), k.stride(1), k.stride(2),
+      ks.stride(0), ks.stride(1), ks.stride(2),
       float(bmm1_scale), float(bmm2_scale)};
 #if FLASHINFER_XQA_DIRECT_TASKS
-  dim3 grid(ctas / plan.batch, 1, plan.batch);
+  dim3 grid(ctas / plan.batch, heads, plan.batch);
 #else
-  dim3 grid(ctas);
+  dim3 grid(ctas, heads);
 #endif
   auto config = makeLaunchConfig(grid, dim3(128, 1, 2), sizeof(SharedMem),
                                  get_stream(device), enable_pdl);
@@ -172,3 +197,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_host, bucket_plan_host);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, bucket_compute);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(scratch_bytes, bucket_scratch_bytes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure, bucket_configure);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(grid_y_limit, bucket_grid_y_limit);

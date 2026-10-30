@@ -10,17 +10,24 @@ from ...compilation_context import CompilationContext
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec
 from ...jit.xqa import xqa_nvcc_flags
-from .geometry import max_table_width
+from .geometry import check_head_config, max_table_width
 
 
-def gen_module(persistent: bool, *, direct: bool = False, page_size: int = 32):
+def gen_module(
+    persistent: bool,
+    *,
+    direct: bool = False,
+    page_size: int = 32,
+    head_group_ratio: int = 6,
+):
     max_table_width(page_size)
+    check_head_config(1, head_group_ratio)
     if direct:
         persistent = False
     source = Path(__file__).resolve().parent / "csrc"
     flags = CompilationContext().get_nvcc_flags_list(supported_major_versions=[12])
     return gen_jit_spec(
-        f"experimental_xqa_decode_buckets_q6_kv1_d256_p{page_size}_persistent_{int(persistent)}_direct_{int(direct)}",
+        f"experimental_xqa_decode_buckets_r{head_group_ratio}_d256_p{page_size}_persistent_{int(persistent)}_direct_{int(direct)}",
         [source / "binding.cu"],
         extra_cuda_cflags=xqa_nvcc_flags
         + flags
@@ -28,7 +35,7 @@ def gen_module(persistent: bool, *, direct: bool = False, page_size: int = 32):
             "--expt-relaxed-constexpr",
             "-Xptxas=-v",
             "-DHEAD_ELEMS=256",
-            "-DHEAD_GRP_SIZE=6",
+            f"-DHEAD_GRP_SIZE={head_group_ratio}",
             "-DINPUT_FP16=0",
             "-DCACHE_ELEM_ENUM=3",
             f"-DTOKENS_PER_PAGE={page_size}",
@@ -46,12 +53,20 @@ def gen_module(persistent: bool, *, direct: bool = False, page_size: int = 32):
 
 @functools.cache
 def get_module(
-    persistent: bool, device: torch.device, *, direct: bool = False, page_size: int = 32
+    persistent: bool,
+    device: torch.device,
+    *,
+    direct: bool = False,
+    page_size: int = 32,
+    head_group_ratio: int = 6,
 ):
     # Configure dynamic shared memory outside capture, on each owning device.
     with torch.cuda.device(device):
         module = gen_module(
-            persistent, direct=direct, page_size=page_size
+            persistent,
+            direct=direct,
+            page_size=page_size,
+            head_group_ratio=head_group_ratio,
         ).build_and_load()
         resources = torch.empty(4, dtype=torch.int64)
         module.configure(resources)
