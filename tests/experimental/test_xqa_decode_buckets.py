@@ -110,6 +110,7 @@ int main() {{
       0,0,0,0, 0,0,0,0, 0,0, 0,2, 2,1, 0,1, 1,2, 2,3, 0,0, 2,3,3,2}};
   assert(storage == expected);
   for (bool aligned : {{false, true}}) {{
+    for (int page_size : {{16, 32, 64}}) {{
     for (int batch : {{1, 3, 8, 32}}) {{
       for (int ctas : {{32, 170, 340}}) {{
         for (int generation = 0; generation < 5; ++generation) {{
@@ -117,10 +118,11 @@ int main() {{
           for (int r = 0; r < batch; ++r)
             lens[r] = generation == 0 ? 0 :
                 (generation == 1 ? 4096 : (generation == 2 ? (r ? 4096 : 131072) :
-                  (generation == 3 ? (r * 257) % 8193 : 2147483360)));
+                  (generation == 3 ? (r * 257) % 8193 : max_table_width(page_size) * page_size)));
           int capacity = ctas + batch - 1;
           std::vector<int> data(descriptor_words(batch, ctas) + 2, -71);
-          plan_host(lens.data(), data.data() + 1, batch, ctas, MaxTableWidth, aligned);
+          plan_host(lens.data(), data.data() + 1, batch, ctas,
+                    max_table_width(page_size), aligned, page_size);
           assert(data.front() == -71 && data.back() == -71);
           auto* tasks = reinterpret_cast<XQABucketTask*>(data.data() + 1);
           auto* requests = reinterpret_cast<XQABucketRange*>(data.data() + 1 + 4 * capacity);
@@ -150,6 +152,16 @@ int main() {{
         }}
       }}
     }}
+    }}
+  }}
+  for (int page_size : {{16, 32, 64}}) {{
+    lengths[0] = 0; lengths[1] = page_size; lengths[2] = 1;
+    plan_host(lengths, storage.data(), 3, 4, 1, false, page_size);
+    lengths[1] = page_size + 1;
+    bool rejected = false;
+    try {{ plan_host(lengths, storage.data(), 3, 4, 1, false, page_size); }}
+    catch (const std::invalid_argument&) {{ rejected = true; }}
+    assert(rejected);
   }}
   for (int invalid : {{-1, 769}}) {{
     lengths[1] = invalid;
@@ -171,33 +183,40 @@ int main() {{
     subprocess.run([str(binary)], check=True, capture_output=True, timeout=10)
 
 
-def _case(lengths, *, interleaved=False, capacity_length=None):
+def _case(lengths, *, interleaved=False, capacity_length=None, page_size=32):
     device = torch.device("cuda", torch.cuda.current_device())
     # Reserve the same per-request capacity for changed row lengths/page mappings.
     capacity_length = max(lengths) if capacity_length is None else capacity_length
     assert capacity_length >= max(lengths)
-    width = max(1, (capacity_length + 31) // 32)
+    width = max(1, (capacity_length + page_size - 1) // page_size)
     batch, pages = len(lengths), width * len(lengths)
     if interleaved:
-        backing = torch.empty((pages, 2 * 32 * 144), dtype=torch.uint8, device=device)
+        half = page_size * 144
+        backing = torch.empty((pages, 2 * half), dtype=torch.uint8, device=device)
         data = [
-            backing.as_strided((pages, 32, 1, 128), (9216, 128, 128, 1), side * 4608)
+            backing.as_strided(
+                (pages, page_size, 1, 128), (2 * half, 128, 128, 1), side * half
+            )
             for side in range(2)
         ]
         sf_bytes = backing.view(torch.float8_e4m3fn)
         scales = [
             sf_bytes.as_strided(
-                (pages, 32, 1, 16), (9216, 16, 16, 1), side * 4608 + 4096
+                (pages, page_size, 1, 16),
+                (2 * half, 16, 16, 1),
+                side * half + page_size * 128,
             )
             for side in range(2)
         ]
     else:
         data = [
-            torch.empty((pages, 32, 1, 128), dtype=torch.uint8, device=device)
+            torch.empty((pages, page_size, 1, 128), dtype=torch.uint8, device=device)
             for _ in range(2)
         ]
         scales = [
-            torch.empty((pages, 32, 1, 16), dtype=torch.float8_e4m3fn, device=device)
+            torch.empty(
+                (pages, page_size, 1, 16), dtype=torch.float8_e4m3fn, device=device
+            )
             for _ in range(2)
         ]
     for value in data:
@@ -224,10 +243,11 @@ def _reference(query, data, scales, table, lengths, bmm1, bmm2):
         device=query.device,
     )
     output = torch.zeros_like(query)
+    page_size = data[0].shape[1]
     for row, length in enumerate(lengths):
         if not length:
             continue
-        ids = table[row, : (length + 31) // 32].long()
+        ids = table[row, : (length + page_size - 1) // page_size].long()
         operands = []
         for packed, sf in zip(data, scales, strict=True):
             values = packed[ids].view(-1, 128)[:length]
@@ -316,13 +336,42 @@ def _check_changed_graph(
     capacity_length=None,
     direct_batch=1,
     planner="gpu",
+    page_size=32,
 ):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
     from flashinfer.experimental.xqa_decode_buckets import backend
 
-    initial = [0, 1, 31, 32, 33, 255, 256, 257, 511, 512, 513, 0, 8193]
-    changed = [513, 0, 257, 1, 0, 512, 31, 256, 33, 255, 32, 8193, 0]
+    initial = [
+        0,
+        1,
+        page_size - 1,
+        page_size,
+        page_size + 1,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        0,
+        8193,
+    ]
+    changed = [
+        513,
+        0,
+        257,
+        1,
+        0,
+        512,
+        page_size - 1,
+        256,
+        page_size + 1,
+        255,
+        page_size,
+        8193,
+        0,
+    ]
     replay_lengths = (initial, changed, [0] * len(initial), initial)
     if direct and direct_batch == 1:
         initial = [512]
@@ -350,12 +399,16 @@ def _check_changed_graph(
             initial = [0, 1, 255, 256] * 8
             replay_lengths = (initial, [256, 0, 1, 255] * 8, [0] * 32, initial)
     queries, data, scales, table, lens = _case(
-        initial, interleaved=interleaved, capacity_length=capacity_length
+        initial,
+        interleaved=interleaved,
+        capacity_length=capacity_length,
+        page_size=page_size,
     )
     plan = create_xqa_decode_bucket_plan(
         lens,
         page_table_width=table.shape[1],
         mode=mode,
+        page_size=page_size,
         planner=planner,
         host_seq_lens=torch.tensor(initial, dtype=torch.int32)
         if planner == "host"
@@ -364,7 +417,17 @@ def _check_changed_graph(
     assert plan.direct == direct
     if direct and capacity_length == 512:
         assert plan.ctas == 2 * len(initial)
-    print(dict(mode=mode, resources=plan.resources, ctas=plan.ctas), flush=True)
+    assert plan.page_size == page_size
+    print(
+        dict(
+            mode=mode,
+            planner=planner,
+            page_size=page_size,
+            resources=plan.resources,
+            ctas=plan.ctas,
+        ),
+        flush=True,
+    )
     workspaces = [plan.create_workspace() for _ in queries]
     assert len({workspace.scratch.data_ptr() for workspace in workspaces}) == len(
         workspaces
@@ -520,6 +583,32 @@ class GeometryTests(unittest.TestCase):
         ):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 geometry.plan_geometry(*values)
+        for page_size in (16, 32, 64):
+            self.assertEqual(
+                geometry.plan_geometry(4, 512 // page_size, 132, page_size), (8, True)
+            )
+            self.assertEqual(
+                geometry.plan_geometry(4, 8192 // page_size, 132, page_size),
+                (128, True),
+            )
+            self.assertEqual(
+                geometry.plan_geometry(4, 8448 // page_size, 132, page_size),
+                (132, True),
+            )
+            self.assertEqual(
+                geometry.plan_geometry(4, 8448 // page_size + 1, 132, page_size),
+                (132, False),
+            )
+            self.assertEqual(
+                geometry.max_table_width(page_size), ((1 << 31) - 256) // page_size
+            )
+            with self.assertRaises(ValueError):
+                geometry.plan_capacity(
+                    4, 132, geometry.max_table_width(page_size) + 1, page_size
+                )
+        for page_size in (True, 0, 8, 24, 128, 32.0):
+            with self.assertRaises(ValueError):
+                geometry.plan_geometry(4, 16, 132, page_size)
 
     def test_aligned_boundaries_use_wide_intermediates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -590,6 +679,40 @@ class BucketModuleTests(unittest.TestCase):
             for lengths in ([512], [8064] * 32, [131072] + [4096] * 31):
                 with self.subTest(mode=mode, lengths=lengths):
                     _check_module_case(lengths, mode)
+
+
+class BucketPageTests(unittest.TestCase):
+    def test_page_replay(self):
+        _require_sm120()
+        for page_size in (16, 64):
+            for mode in ("persistent", "aligned"):
+                for planner in ("gpu", "host"):
+                    for interleaved in (False, True):
+                        with self.subTest(
+                            page_size=page_size,
+                            mode=mode,
+                            planner=planner,
+                            interleaved=interleaved,
+                        ):
+                            _check_changed_graph(
+                                mode, interleaved, planner=planner, page_size=page_size
+                            )
+                    _check_changed_graph(
+                        mode,
+                        False,
+                        planner=planner,
+                        page_size=page_size,
+                        direct=True,
+                        direct_batch=4,
+                        capacity_length=512,
+                    )
+            _check_changed_graph(
+                "persistent",
+                True,
+                page_size=page_size,
+                direct=True,
+                capacity_length=131072,
+            )
 
 
 class HostPlannerTests(unittest.TestCase):
@@ -698,6 +821,11 @@ class HostPlannerTests(unittest.TestCase):
             create_xqa_decode_bucket_plan(
                 lens, page_table_width=4096, planner="invalid"
             )
+        for page_size in (True, 8, 24, 128):
+            with self.assertRaises(ValueError):
+                create_xqa_decode_bucket_plan(
+                    lens, page_table_width=4096, page_size=page_size
+                )
 
 
 if __name__ == "__main__":

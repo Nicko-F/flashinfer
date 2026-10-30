@@ -54,19 +54,23 @@ def compare_planners(args):
 
     for label, lengths in scenarios:
         torch.manual_seed(args.seed)
-        batch, width = len(lengths), (max(lengths) + 31) // 32
+        batch, width = (
+            len(lengths),
+            (max(lengths) + args.page_size - 1) // args.page_size,
+        )
         cpu_lengths = torch.tensor(lengths, dtype=torch.int32)
         lens = cpu_lengths.to(args.device)
         table = torch.zeros((batch, width), dtype=torch.int32, device=args.device)
         pages = 0
         for row, length in enumerate(lengths):
-            count = (length + 31) // 32
+            count = (length + args.page_size - 1) // args.page_size
             table[row, :count] = torch.arange(pages, pages + count, device=args.device)
             pages += count
         plans = {
             planner: create_xqa_decode_bucket_plan(
                 lens,
                 page_table_width=width,
+                page_size=args.page_size,
                 mode=args.mode,
                 planner=planner,
                 host_seq_lens=cpu_lengths if planner == "host" else None,
@@ -81,13 +85,19 @@ def compare_planners(args):
             )
             kv = [
                 torch.randint(
-                    0, 256, (pages, 32, 1, 128), dtype=torch.uint8, device=args.device
+                    0,
+                    256,
+                    (pages, args.page_size, 1, 128),
+                    dtype=torch.uint8,
+                    device=args.device,
                 )
                 for _ in range(2)
             ]
             sf = [
                 torch.ones(
-                    (pages, 32, 1, 16), dtype=torch.float8_e4m3fn, device=args.device
+                    (pages, args.page_size, 1, 16),
+                    dtype=torch.float8_e4m3fn,
+                    device=args.device,
                 )
                 for _ in range(2)
             ]
@@ -147,7 +157,9 @@ def compare_planners(args):
         samples["gpu_assign_compute_graph_gpu_us"] = graph_samples(gpu_window)
         host = plans["host"]
         if not host.direct:
-            module, _ = get_module(args.mode == "persistent", lens.device)
+            module, _ = get_module(
+                args.mode == "persistent", lens.device, page_size=args.page_size
+            )
             staging = torch.empty_like(host._host_descriptors, pin_memory=True)
             fill = lambda: module.plan_host(
                 cpu_lengths, staging, host.ctas, width, args.mode == "aligned"
@@ -179,6 +191,7 @@ def compare_planners(args):
                 raise RuntimeError("Counter reset check failed")
         record = dict(
             scenario=label,
+            page_size=args.page_size,
             lengths=lengths,
             layers=args.layers,
             mode=args.mode,
@@ -216,6 +229,7 @@ def main():
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--page-size", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument(
         "--capacity-length", type=int, help="Reserved table capacity in tokens"
     )
@@ -252,15 +266,17 @@ def main():
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
-    counts = [(n + 31) // 32 for n in lengths]
-    width = (capacity + 31) // 32
+    counts = [(n + args.page_size - 1) // args.page_size for n in lengths]
+    width = (capacity + args.page_size - 1) // args.page_size
     table = torch.zeros((len(lengths), width), dtype=torch.int32, device=device)
     offset = 0
     for row, count in enumerate(counts):
         table[row, :count] = torch.arange(offset, offset + count, device=device)
         offset += count
     lens = torch.tensor(lengths, dtype=torch.int32, device=device)
-    plan = create_xqa_decode_bucket_plan(lens, page_table_width=width, mode=args.mode)
+    plan = create_xqa_decode_bucket_plan(
+        lens, page_table_width=width, page_size=args.page_size, mode=args.mode
+    )
     bank = []
     for _ in range(args.layers):
         q = (
@@ -269,12 +285,20 @@ def main():
         )
         k, v = [
             torch.randint(
-                0, 256, (offset, 32, 1, 128), dtype=torch.uint8, device=device
+                0,
+                256,
+                (offset, args.page_size, 1, 128),
+                dtype=torch.uint8,
+                device=device,
             )
             for _ in range(2)
         ]
         ks, vs = [
-            torch.ones((offset, 32, 1, 16), dtype=torch.float8_e4m3fn, device=device)
+            torch.ones(
+                (offset, args.page_size, 1, 16),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
             for _ in range(2)
         ]
         out, native_out = torch.empty_like(q), torch.empty_like(q)
@@ -345,7 +369,8 @@ def main():
             mode=args.mode,
             seed=args.seed,
             resources=plan.resources,
-            capacity_length=width * 32,
+            capacity_length=width * args.page_size,
+            page_size=args.page_size,
             direct=plan.direct,
             assignment_per_window=0 if plan.direct else 1,
         ),
@@ -403,13 +428,13 @@ def main():
                 active_ctas=header[2],
             )
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-        splits = min(max(1, sms // len(lengths)), (width * 32 + 255) // 256)
+        splits = min(max(1, sms // len(lengths)), (width * args.page_size + 255) // 256)
         print(
             dict(
                 plan_topology=topology,
                 native_launch_derived=dict(
                     source="csrc/xqa/mha.cu:3211-3222",
-                    formula="splits=min(max(1,SMs/(B*KVheads)),ceil(table_width*32/256))",
+                    formula="splits=min(max(1,SMs/(B*KVheads)),ceil(table_width*page_size/256))",
                     sm_count=sms,
                     kv_heads=1,
                     grid=[splits, 1, len(lengths)],
@@ -443,6 +468,7 @@ def main():
                 call,
                 enable_cupti=False,
                 use_cuda_graph=True,
+                cold_l2_cache=False,
                 dry_run_iters=5,
                 repeat_iters=20,
             )

@@ -63,8 +63,9 @@ def _prepare(
     header: torch.Tensor,
     ctas: int,
     aligned: bool,
+    page_size: int,
 ) -> None:
-    module, _ = get_module(not aligned, lengths.device)
+    module, _ = get_module(not aligned, lengths.device, page_size=page_size)
     module.plan(lengths, tasks, requests, spans, header, ctas, aligned)
 
 
@@ -77,6 +78,7 @@ def _fake_prepare(
     header: torch.Tensor,
     ctas: int,
     aligned: bool,
+    page_size: int,
 ) -> None:
     pass
 
@@ -105,10 +107,13 @@ def _compute(
     bmm1_scale: float,
     bmm2_scale: float,
     enable_pdl: bool,
+    page_size: int,
 ) -> None:
     # Empty headers are the factory's explicit static direct-plan representation.
     direct = header.numel() == 0
-    module, _ = get_module(not aligned and not direct, q.device, direct=direct)
+    module, _ = get_module(
+        not aligned and not direct, q.device, direct=direct, page_size=page_size
+    )
     module.run(
         q,
         k,
@@ -153,6 +158,7 @@ def _fake_compute(
     bmm1_scale: float,
     bmm2_scale: float,
     enable_pdl: bool,
+    page_size: int,
 ) -> None:
     pass
 
@@ -192,6 +198,7 @@ class BucketPlan:
     header: torch.Tensor
     ctas: int
     table_width: int
+    page_size: int
     mode: str
     scratch_bytes: int
     resources: tuple
@@ -216,7 +223,11 @@ class BucketPlan:
                 # DMA source. This waits only when the prior copy is unfinished.
                 if not self._copy_done.query():
                     self._copy_done.synchronize()
-                module, _ = get_module(self.mode == "persistent", self.lengths.device)
+                module, _ = get_module(
+                    self.mode == "persistent",
+                    self.lengths.device,
+                    page_size=self.page_size,
+                )
                 module.plan_host(
                     self.host_seq_lens,
                     self._host_descriptors,
@@ -237,6 +248,7 @@ class BucketPlan:
                 self.header,
                 self.ctas,
                 self.mode == "aligned",
+                self.page_size,
             )
         return self
 
@@ -253,7 +265,13 @@ class BucketPlan:
 
 
 def create_plan(
-    seq_lens, *, page_table_width, mode="persistent", planner="gpu", host_seq_lens=None
+    seq_lens,
+    *,
+    page_table_width,
+    page_size=32,
+    mode="persistent",
+    planner="gpu",
+    host_seq_lens=None,
 ):
     if mode not in ("persistent", "aligned"):
         raise ValueError("mode must be persistent or aligned")
@@ -272,10 +290,12 @@ def create_plan(
         _host_lengths(host_seq_lens, batch)
     elif host_seq_lens is not None:
         raise ValueError("host_seq_lens is only used with planner='host'")
-    ctas, direct = plan_geometry(batch, page_table_width, get_device_sm_count(device))
-    capacity = plan_capacity(batch, ctas, page_table_width)
+    ctas, direct = plan_geometry(
+        batch, page_table_width, get_device_sm_count(device), page_size
+    )
+    capacity = plan_capacity(batch, ctas, page_table_width, page_size)
     module, resources = get_module(
-        mode == "persistent" and not direct, device, direct=direct
+        mode == "persistent" and not direct, device, direct=direct, page_size=page_size
     )
     host_descriptors = device_descriptors = copy_done = None
     if planner == "host" and not direct:
@@ -305,6 +325,7 @@ def create_plan(
         header,
         ctas,
         page_table_width,
+        page_size,
         mode,
         module.scratch_bytes(capacity),
         resources,
@@ -349,7 +370,7 @@ def run(
         device=device,
     )
     if k_cache.ndim != 4:
-        raise ValueError("Expected packed NHD page32 NVFP4 cache")
+        raise ValueError("Expected packed NHD NVFP4 cache")
     pages = k_cache.shape[0]
     for name, value, dtype, width, unit in (
         ("k_cache", k_cache, torch.uint8, 128, 128),
@@ -361,7 +382,7 @@ def run(
             value,
             name,
             dtype=dtype,
-            shape=(pages, 32, 1, width),
+            shape=(pages, plan.page_size, 1, width),
             device=device,
             contiguous=False,
             alignment=16,
@@ -423,5 +444,6 @@ def run(
             float(bmm1_scale),
             float(bmm2_scale),
             enable_pdl,
+            plan.page_size,
         )
     return out

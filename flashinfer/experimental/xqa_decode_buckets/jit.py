@@ -10,15 +10,17 @@ from ...compilation_context import CompilationContext
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec
 from ...jit.xqa import xqa_nvcc_flags
+from .geometry import max_table_width
 
 
-def gen_module(persistent: bool, *, direct: bool = False):
+def gen_module(persistent: bool, *, direct: bool = False, page_size: int = 32):
+    max_table_width(page_size)
     if direct:
         persistent = False
     source = Path(__file__).resolve().parent / "csrc"
     flags = CompilationContext().get_nvcc_flags_list(supported_major_versions=[12])
     return gen_jit_spec(
-        f"experimental_xqa_decode_buckets_q6_kv1_d256_p32_persistent_{int(persistent)}_direct_{int(direct)}",
+        f"experimental_xqa_decode_buckets_q6_kv1_d256_p{page_size}_persistent_{int(persistent)}_direct_{int(direct)}",
         [source / "binding.cu"],
         extra_cuda_cflags=xqa_nvcc_flags
         + flags
@@ -29,7 +31,7 @@ def gen_module(persistent: bool, *, direct: bool = False):
             "-DHEAD_GRP_SIZE=6",
             "-DINPUT_FP16=0",
             "-DCACHE_ELEM_ENUM=3",
-            "-DTOKENS_PER_PAGE=32",
+            f"-DTOKENS_PER_PAGE={page_size}",
             "-DSLIDING_WINDOW=0",
             "-DLOW_PREC_OUTPUT=0",
             "-DSPEC_DEC=0",
@@ -43,10 +45,14 @@ def gen_module(persistent: bool, *, direct: bool = False):
 
 
 @functools.cache
-def get_module(persistent: bool, device: torch.device, *, direct: bool = False):
+def get_module(
+    persistent: bool, device: torch.device, *, direct: bool = False, page_size: int = 32
+):
     # Configure dynamic shared memory outside capture, on each owning device.
     with torch.cuda.device(device):
-        module = gen_module(persistent, direct=direct).build_and_load()
+        module = gen_module(
+            persistent, direct=direct, page_size=page_size
+        ).build_and_load()
         resources = torch.empty(4, dtype=torch.int64)
         module.configure(resources)
     return module, tuple(resources.tolist())

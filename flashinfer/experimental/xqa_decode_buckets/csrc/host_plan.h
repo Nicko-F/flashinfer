@@ -13,7 +13,9 @@ struct XQABucketSpan { int begin, end; };
 namespace flashinfer::xqa_buckets {
 constexpr int MaxBatch = 32;
 constexpr int Tile = 256;
-constexpr int MaxTableWidth = (0x7fffffff - (Tile - 1)) / 32;
+constexpr int max_table_width(int page_size) {
+  return (0x7fffffff - (Tile - 1)) / page_size;
+}
 
 inline int64_t descriptor_words(int batch, int ctas) {
   return int64_t(6) * (int64_t(ctas) + batch);
@@ -23,13 +25,14 @@ inline int64_t descriptor_words(int batch, int ctas) {
 // Keep the ownership arithmetic identical to assign; only its execution moves
 // to the CPU. The GPU planner retains its parallel task/span fill.
 inline void plan_host(const int* lengths, int* storage, int batch, int ctas,
-                      int table_width, bool aligned) {
+                      int table_width, bool aligned, int page_size = 32) {
   if (batch < 1 || batch > MaxBatch || ctas < batch || ctas > INT32_MAX - MaxBatch ||
-      table_width < 1 || table_width > MaxTableWidth)
+      (page_size != 16 && page_size != 32 && page_size != 64) ||
+      table_width < 1 || table_width > max_table_width(page_size))
     throw std::invalid_argument("Invalid host bucket plan geometry");
   int prefix[MaxBatch + 1] = {}, base[MaxBatch + 1] = {}, first[MaxBatch];
   for (int r = 0; r < batch; ++r) {
-    if (lengths[r] < 0 || int64_t(lengths[r]) > int64_t(table_width) * 32)
+    if (lengths[r] < 0 || int64_t(lengths[r]) > int64_t(table_width) * page_size)
       throw std::invalid_argument("Host sequence lengths must fit the page table capacity");
     prefix[r + 1] = prefix[r] + direct_tile_count(lengths[r]);
   }

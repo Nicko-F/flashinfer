@@ -70,11 +70,11 @@ void bucket_plan_host(TensorView lengths, TensorView descriptors, int64_t ctas,
   int64_t batch = lengths.numel();
   TVM_FFI_ICHECK(batch >= 1 && batch <= buckets::MaxBatch && ctas >= batch &&
                  ctas <= INT32_MAX - buckets::MaxBatch);
-  TVM_FFI_ICHECK(table_width >= 1 && table_width <= buckets::MaxTableWidth);
+  TVM_FFI_ICHECK(table_width >= 1 && table_width <= buckets::max_table_width(tokensPerPage));
   TVM_FFI_ICHECK_EQ(descriptors.numel(), buckets::descriptor_words(int(batch), int(ctas)));
   buckets::plan_host(static_cast<const int*>(lengths.data_ptr()),
                      static_cast<int*>(descriptors.data_ptr()), int(batch), int(ctas),
-                     int(table_width), aligned);
+                     int(table_width), aligned, tokensPerPage);
 }
 
 int64_t bucket_scratch_bytes(int64_t capacity) {
@@ -119,9 +119,9 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
   TVM_FFI_ICHECK_EQ(lengths.device().device_id, device.device_id);
   CHECK_DIM(2, table);
   TVM_FFI_ICHECK_EQ(table.size(0), plan.batch);
-  TVM_FFI_ICHECK(table.size(1) >= 1 && table.size(1) <= buckets::MaxTableWidth);
+  TVM_FFI_ICHECK(table.size(1) >= 1 && table.size(1) <= buckets::max_table_width(tokensPerPage));
 #if FLASHINFER_XQA_DIRECT_TASKS
-  int64_t tiles_per_request = (table.size(1) * 32 + buckets::Tile - 1) / buckets::Tile;
+  int64_t tiles_per_request = (table.size(1) * tokensPerPage + buckets::Tile - 1) / buckets::Tile;
   if (plan.batch == 1) {
     TVM_FFI_ICHECK_LE(ctas, tiles_per_request);
   } else {
@@ -134,7 +134,7 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
     CHECK_DIM(4, t);
     TVM_FFI_ICHECK_EQ(t.device().device_id, device.device_id);
     TVM_FFI_ICHECK_EQ(t.size(0), k.size(0));
-    TVM_FFI_ICHECK_EQ(t.size(1), 32);
+    TVM_FFI_ICHECK_EQ(t.size(1), tokensPerPage);
     TVM_FFI_ICHECK_EQ(t.size(2), 1);
   }
   CHECK_INPUT_TYPE(k, dl_uint8);

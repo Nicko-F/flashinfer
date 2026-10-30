@@ -47,6 +47,8 @@ static_assert(ctaSize == 256 && ctaShapeInWarps.x == 4 && ctaShapeInWarps.y == 1
               headGrpSize == 6 && SPEC_DEC == 0 && BEAM_WIDTH == 1 && USE_CUSTOM_BARRIER == 1,
               "Task/barrier ownership supports only the declared q1/Q6/KV1/D256 core");
 static_assert(ctaTile.x == Tile);
+static_assert((tokensPerPage == 16 || tokensPerPage == 32 || tokensPerPage == 64) &&
+              Tile % tokensPerPage == 0, "Supported page sizes must divide the KV tile");
 static_assert(!FLASHINFER_XQA_DIRECT_TASKS || !FLASHINFER_XQA_PERSISTENT_TASKS,
               "Direct geometry uses the nonpersistent one-task core");
 static_assert(sizeof(SharedMem::Barrier) == 8 &&

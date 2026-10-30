@@ -22,21 +22,22 @@ an issue nor a target release is claimed by this preparation patch.
 
 - SM120; one query token per request, `1 <= B <= 32`.
 - Contiguous BF16 Q/output `[B,6,256]`; one local KV head.
-- Packed NVFP4 K/V `[pages,32,1,128]`, E4M3 block scales `[pages,32,1,16]`, NHD.
+- Packed NVFP4 K/V `[pages,page_size,1,128]`, E4M3 block scales
+  `[pages,page_size,1,16]`, NHD, with `page_size` in `{16,32,64}` (default 32).
   Native page/token byte strides are retained; the packed head is contiguous.
 - Contiguous CUDA int32 page table `[B,width]` and sequence lengths `[B]`.
 - Independent finite effective BMM1 (QK) and BMM2 (V/output) scales.
 - No sinks, sliding windows, soft caps, speculative rows, or FP8 output.
 
-Lengths must be nonnegative and no larger than `width * 32`. Every physical page
+Lengths must be nonnegative and no larger than `width * page_size`. Every physical page
 ID reached by a live length must address the supplied cache. These device-value
 conditions are caller preconditions; the hot path does not synchronize to inspect
 them. Zero-length rows produce zero output.
 
 There is no model, TP degree, layer count, run-directory or configured 128K
-requirement. Width is bounded by `(INT32_MAX - 255) // 32`: this keeps padded tile
+requirement. Width is bounded by `(INT32_MAX - 255) // page_size`: this keeps padded tile
 ends and all 32 dense table rows representable. CTA count is
-`max(B, min(SMs, B * ceil(width * 32 / 256)))`, with at least B CTAs for zero-row
+`max(B, min(SMs, B * ceil(width * page_size / 256)))`, with at least B CTAs for zero-row
 owners. This uses static table capacity, not a device-to-host length read. A wide
 reserved table can retain a full grid even when its live prefix is short.
 Compact task capacity
@@ -64,7 +65,7 @@ for q, k, v, ks, vs, out in compatible_attention_layers:
 ```
 
 The factory selects `plan.direct` when `B == 1` or
-`B * ceil(width * 32 / 256) <= SMs`. This is a static capacity condition, not a
+`B * ceil(width * page_size / 256) <= SMs`. This is a static capacity condition, not a
 measured-length heuristic. Otherwise the initial factory call prepares one
 generation and `prepare()` refreshes task contents without replacing pointers.
 
@@ -84,6 +85,13 @@ share request order and live lengths, but retain independent Q/cache/output.
 per CTA. Both modes select the same specialization when `plan.direct` is true.
 For other shapes the modes remain explicit controls, not a validated
 load-dependent routing policy.
+
+The optional factory argument `page_size=32` is retained in `plan.page_size` and
+selects a page-specific JIT/cache key and native `TOKENS_PER_PAGE` specialization.
+Page sizes 16, 32 and 64 divide the unchanged 256-token CTA tile. The descriptor
+ABI, ownership in token tiles, Q6/KV1/D256/q1 contract and native arithmetic are
+unchanged. Cache views and the CPU host planner use the selected page capacity;
+both planners and both ownership modes support all three page sizes.
 
 Plans, workspace and referenced tensors must outlive every asynchronous consumer
 and captured Graph. Sequential layers may share scratch/counters after the prior
@@ -163,6 +171,8 @@ Run the focused tests on an SM120 system with normal FlashInfer dependencies:
 ```bash
 pytest tests/experimental/test_xqa_decode_buckets.py -q
 python examples/xqa_decode_buckets.py --lengths 131072,4096,4096,4096 --layers 16 --benchmark
+# Select native page geometry explicitly; omit to retain page32.
+python examples/xqa_decode_buckets.py --page-size 16 --lengths 65536,4096,4096,4096 --benchmark
 ```
 
 The example compares native and bucket windows with the same caller-owned inputs,
@@ -177,6 +187,9 @@ currently no-ops; the declarations here do not establish torch.compile/fullgraph
 compatibility. Framework integration must validate its actual capture boundary.
 
 ## Initial module validation (2026-10-30, before the small-work fix)
+
+Historical measurements in the following sections use page size 32 unless
+another page size is explicitly stated.
 
 Source import, JIT and all six focused tests passed on an RTX 5090 (SM120),
 Torch 2.14.0+cu130 and CUDA 13. The tests include four changed-input Graph cases
@@ -345,3 +358,41 @@ An initial timing harness attempt failed by capturing an existing Graph replay;
 it produced no result row and was preserved. The corrected invocation captures
 the original compute closures with the benchmark helper. The clean timing run
 was not repeated.
+
+## Page geometry expansion (2026-10-30 UTC)
+
+The page16/32/64 slice passed all twelve focused test groups in 81.526 seconds.
+The original default-page32 groups remain. Twenty-six added replay subcases
+exercise page16/64 with both planners and modes, separate/interleaved cache
+storage, page and tile tails, changed lengths/page IDs, zero/restore and direct
+controls. CPU tests also cover each page size's maximum width and host capacity
+rejection. Q6/KV1/D256/q1, task ownership and native compute remain unchanged.
+
+All nine compiled page/mode variants report zero spill loads/stores, 70,272
+shared bytes and one resident CTA per SM. Page specialization changes registers
+and stack even though the source compute body is unchanged:
+
+| Page size | Persistent registers | Aligned registers | Direct registers | Stack bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 208 | 196 | 194 | 128 |
+| 32 | 201 | 186 | 186 | 112 |
+| 64 | 213 | 194 | 193 | 64 |
+
+Three bounded matched GPU Graph measurements used RTX 5090 physical GPU0/NUMA0
+CPU affinity, seed0, two layers and lengths `65536 + 7 x 4096`. Each page size
+uses its corresponding native control and cache layout. These are hot-cache
+GPU Graph medians in microseconds, five warmups and twenty samples per arm,
+CUPTI off and cold-L2 handling off. The persistent candidate includes one GPU
+Assign per two-layer window; native before/after brackets it. JIT and allocation
+are outside timing.
+
+| Page size | Native before | Native after | Persistent candidate |
+| --- | ---: | ---: | ---: |
+| 16 | 180.443 | 180.496 | 93.558 |
+| 32 | 173.325 | 173.275 | 77.378 |
+| 64 | 158.989 | 158.872 | 73.280 |
+
+Each timing was run once after qualification. These anchors establish page
+geometry support for this bounded q1 contract. Host-planner timing at the new
+page sizes, larger head configurations, multiple query tokens and model/service
+integration remain separate work.

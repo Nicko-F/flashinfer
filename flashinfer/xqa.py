@@ -42,6 +42,7 @@ def create_xqa_decode_bucket_plan(
     seq_lens: torch.Tensor,
     *,
     page_table_width: int,
+    page_size: int = 32,
     mode: str = "persistent",
     planner: str = "gpu",
     host_seq_lens: Optional[torch.Tensor] = None,
@@ -49,12 +50,13 @@ def create_xqa_decode_bucket_plan(
     """Allocate and prepare an experimental reusable q1 Decode work plan.
 
     ``seq_lens`` is contiguous CUDA int32 ``[B]`` storage with ``1 <= B <= 32``.
-    Its values must stay between zero and ``page_table_width * 32``. The plan
+    ``page_size`` is 16, 32 (default), or 64 tokens. Length values must stay
+    between zero and ``page_table_width * page_size``. The plan
     retains this storage; its contents may change, while its address and shape
     remain fixed. Call ``plan.prepare()`` once after updating lengths for each
     subsequent forward, before all attention layers sharing the request order.
     A direct plan is selected for ``B=1`` or when the static total tile bound
-    ``B * ceil(page_table_width * 32 / 256)`` fits the device SM count. For these
+    ``B * ceil(page_table_width * page_size / 256)`` fits the device SM count. For these
     plans ``prepare()`` is a no-op: compute derives contiguous boundaries from
     live device lengths. Both mode names select the same direct one-task-per-CTA
     path; its descriptor tensors are empty and no assignment kernel is launched.
@@ -87,6 +89,7 @@ def create_xqa_decode_bucket_plan(
     return create_plan(
         seq_lens,
         page_table_width=page_table_width,
+        page_size=page_size,
         mode=mode,
         planner=planner,
         host_seq_lens=host_seq_lens,
@@ -112,8 +115,9 @@ def xqa_decode_with_buckets(
     """Run q1 native XQA math using an experimental work plan.
 
     Supports SM120 BF16 Q/output ``[B,6,256]``, one local KV head, NHD
-    page32 NVFP4 K/V ``[pages,32,1,128]`` and E4M3 block scales
-    ``[pages,32,1,16]``. Packed data and scale byte strides are retained.
+    NVFP4 K/V ``[pages,plan.page_size,1,128]`` and E4M3 block scales
+    ``[pages,plan.page_size,1,16]``, with page size 16, 32 or 64.
+    Packed data and scale byte strides are retained.
     ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
     reached by live lengths must address allocated cache pages. Zero-length
     rows write zeros. There are no sliding windows, sinks or speculative rows.
