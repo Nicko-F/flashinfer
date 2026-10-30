@@ -138,7 +138,7 @@ def _assert_output(actual, expected):
 
 def _assert_plan(plan, lengths):
     counts = [(n + 255) // 256 for n in lengths]
-    limit = max(2, (sum(counts) + plan.ctas - 1) // plan.ctas)
+    limit = max(1, (sum(counts) + plan.ctas - 1) // plan.ctas)
     if plan.mode == "aligned":
         lo, hi = 1, max(1, max(counts))
         while lo < hi:
@@ -288,6 +288,9 @@ def _check_module_case(lengths, mode):
         bmm2_scale=1.3,
     )
     _assert_plan(plan, lengths)
+    if lengths == [512]:
+        # Two tiles should have two nonempty CTA owners even on a large GPU.
+        assert (plan.spans[:, 1] > plan.spans[:, 0]).sum().item() == 2
     _assert_output(
         actual, _reference(queries[0], data, scales, table, lengths, 0.7 / 16, 1.3)
     )

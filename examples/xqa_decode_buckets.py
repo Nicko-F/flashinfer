@@ -21,6 +21,11 @@ def main():
         "--mode", choices=("persistent", "aligned"), default="persistent"
     )
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Time planner and compute windows separately",
+    )
     args = parser.parse_args()
     lengths = [int(n) for n in args.lengths.split(",")]
     if not 1 <= len(lengths) <= 32 or min(lengths) < 1 or args.layers < 1:
@@ -60,8 +65,7 @@ def main():
         native_scratch = torch.zeros(40 * 2**20, dtype=torch.uint8, device=device)
         bank.append((q, k, v, ks, vs, out, native_out, workspace, native_scratch))
 
-    def candidate():
-        plan.prepare()
+    def compute():
         for q, k, v, ks, vs, out, _, workspace, _ in bank:
             xqa_decode_with_buckets(
                 q,
@@ -76,6 +80,10 @@ def main():
                 bmm2_scale=1.3,
                 out=out,
             )
+
+    def candidate():
+        plan.prepare()
+        compute()
 
     def native():
         for q, k, v, ks, vs, _, native_out, _, scratch in bank:
@@ -95,16 +103,23 @@ def main():
     native()
     candidate()
     torch.cuda.synchronize()
-    for _, _, _, _, _, out, native_out, workspace, _ in bank:
-        error = (
-            out.float() - native_out.float()
-        ).norm() / native_out.float().norm().clamp_min(1e-8)
-        if (
-            not torch.isfinite(out).all()
-            or error.item() >= 0.03
-            or workspace.semaphores.any()
-        ):
-            raise RuntimeError("Module output/counter check failed")
+
+    def check_outputs():
+        errors = []
+        for _, _, _, _, _, out, native_out, workspace, _ in bank:
+            error = (
+                out.float() - native_out.float()
+            ).norm() / native_out.float().norm().clamp_min(1e-8)
+            errors.append(error.item())
+            if (
+                not torch.isfinite(out).all()
+                or errors[-1] >= 0.03
+                or workspace.semaphores.any()
+            ):
+                raise RuntimeError("Module output/counter check failed")
+        return errors
+
+    check_outputs()
     print(
         dict(
             device=str(device),
@@ -117,13 +132,50 @@ def main():
         ),
         flush=True,
     )
-    if args.benchmark:
+    if args.diagnose:
+        header = plan.header.cpu().tolist()
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        splits = min(max(1, sms // len(lengths)), (max(lengths) + 255) // 256)
+        print(
+            dict(
+                plan_topology=dict(
+                    header=header,
+                    tasks=plan.tasks[: header[1]].cpu().tolist(),
+                    requests=plan.requests.cpu().tolist(),
+                    grid_ctas=plan.ctas,
+                    active_ctas=header[2],
+                ),
+                native_launch_derived=dict(
+                    source="csrc/xqa/mha.cu:3211-3222",
+                    formula="splits=min(max(1,SMs/(B*KVheads)),ceil(maxlen/256))",
+                    sm_count=sms,
+                    kv_heads=1,
+                    grid=[splits, 1, len(lengths)],
+                    grid_ctas=splits * len(lengths),
+                    nonempty_tile_ctas=sum(
+                        min(splits, (n + 255) // 256) for n in lengths
+                    ),
+                ),
+                compute_math="native QK/PV; transposed compute is not implemented",
+            ),
+            flush=True,
+        )
+    if args.benchmark or args.diagnose:
         # Warm both and bracket the candidate with native; report absolute samples.
-        for label, call in (
+        windows = (
             ("native_before", native),
             ("candidate", candidate),
             ("native_after", native),
-        ):
+        )
+        if args.diagnose:
+            windows = (
+                ("native_before", native),
+                ("assign_only", plan.prepare),
+                ("compute_only", compute),
+                ("assign_and_compute", candidate),
+                ("native_after", native),
+            )
+        for label, call in windows:
             times = bench_gpu_time(
                 call,
                 enable_cupti=False,
@@ -139,8 +191,12 @@ def main():
                 ),
                 flush=True,
             )
+        if args.diagnose:
+            print(
+                dict(diagnostic_relative_rms=check_outputs(), counters_reset=True),
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
     main()
-

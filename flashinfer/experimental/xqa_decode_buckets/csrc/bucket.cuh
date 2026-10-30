@@ -66,7 +66,7 @@ __global__ void assign(PlanParams p) {
     prefix[0] = base[0] = 0;
     for (int r = 0; r < p.batch; ++r)
       prefix[r + 1] = prefix[r] + ceildiv(p.lengths[r], Tile);
-    budget = max(2, ceildiv(prefix[p.batch], p.ctas));
+    budget = max(1, ceildiv(prefix[p.batch], p.ctas));
     if (p.aligned) {
       int lo = 1, hi = 1;
       for (int r = 0; r < p.batch; ++r) hi = max(hi, prefix[r + 1] - prefix[r]);

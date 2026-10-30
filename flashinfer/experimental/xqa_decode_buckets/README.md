@@ -97,7 +97,7 @@ counters and canaries. Existing FlashInfer custom-op/fake decorators are
 currently no-ops; the declarations here do not establish torch.compile/fullgraph
 compatibility. Framework integration must validate its actual capture boundary.
 
-## Module validation (2026-10-30)
+## Initial module validation (2026-10-30, before the small-work fix)
 
 Source import, JIT and all six focused tests passed on an RTX 5090 (SM120),
 Torch 2.14.0+cu130 and CUDA 13. The tests include four changed-input Graph cases
@@ -121,10 +121,9 @@ are reused: these are hot-cache measurements, not rotated/cold-cache results.
 | 128K + 31 x 4K | aligned | 1380.283 | 154.896 | 8.911 |
 
 There are clear small/uniform regressions; these modes are not a universal native
-replacement or a validated automatic dispatch policy. For B=1/L=512, the current
+replacement or a validated automatic dispatch policy. For B=1/L=512, the initial
 persistent minimum budget of two tiles gives one active CTA, versus two native
-CTAs. Both bucket modes still launch an SM-sized grid. Separate planning/compute
-diagnostics are being collected before changing this policy.
+CTAs. Both bucket modes still launch an SM-sized grid.
 
 Runtime resources were 201 registers/thread for persistent and 186 for aligned,
 with 70,272 shared bytes, 112 local bytes and one resident CTA/SM for both. Aligned
@@ -132,3 +131,30 @@ ptxas reports a 112-byte stack and zero spill loads/stores. Persistent compiler
 spill output was not retained, so its spill status is unconfirmed; local bytes
 alone are not evidence of spilling.
 
+### Small-work diagnosis and correction
+
+`--diagnose` times planning, two compute calls, and the complete window separately
+on the same allocations. Before the correction, persistent compute alone took
+32.454 us; aligned compute took 23.517 us, close to its bracketed native result.
+The actual persistent plan assigned the two 256-token tiles to one CTA. Native
+and aligned used two nonempty CTAs. The independent timings are not assumed to
+add exactly: Graph dependencies and overlap affect the combined window.
+
+The correction allows a one-tile bucket when work is smaller than the CTA budget.
+It preserves the native arithmetic, barriers, SM-sized launch grid and large-work
+budget. A two-owner regression assertion and all six focused tests passed.
+
+| B=1, length=512, two layers | After correction (us) |
+| --- | ---: |
+| Native before / after | 23.718 / 23.718 |
+| Plan only | 1.947 |
+| Persistent compute only | 23.722 |
+| Plan + persistent compute | 26.589 |
+
+The compute-only regression is removed in this case. The complete window remains
+12.1% slower than native; planning/dependency overhead remains a separate problem.
+This is not an automatic-fallback or universal-speedup claim. The natural rebuild
+also reports zero spill loads/stores for persistent, with its 201 registers and
+112-byte stack unchanged. The transposed Compute proposal is still not included.
+The B32 skew anchor retains the same 142.813 us candidate median; the large-work
+budget is unchanged. This anchor does not replace a later full integration study.
