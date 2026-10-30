@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU arithmetic and SM120 native-XQA bucket behavior tests."""
 
+from contextlib import nullcontext
+import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
@@ -28,6 +30,25 @@ def _check_aligned_boundaries(tmp_path):
 #include <initializer_list>
 int main() {{
   using flashinfer::xqa_buckets::aligned_boundary;
+  using flashinfer::xqa_buckets::direct_split_count;
+  using flashinfer::xqa_buckets::direct_tile_count;
+  assert(direct_split_count(0, 2) == 0);
+  assert(direct_split_count(512, 170) == 2);
+  for (int length : {{0, 1, 255, 256, 257, 512, 8193, 2147483647}}) {{
+    for (int cap : {{1, 2, 32, 170, 1024}}) {{
+      int tiles = direct_tile_count(length), count = direct_split_count(length, cap);
+      assert(tiles == (int64_t(length) + 255) / 256);
+      assert(count >= 0 && count <= cap && count <= tiles);
+      int previous = 0;
+      for (int i = 0; i < count; ++i) {{
+        assert(aligned_boundary(i, tiles, count) == previous);
+        int end = aligned_boundary(i + 1, tiles, count);
+        assert(end > previous && end <= tiles);
+        previous = end;
+      }}
+      assert(previous == tiles);
+    }}
+  }}
   for (int n : {{1, 2, 33, 512, 8388607}}) {{
     for (int count : {{1, 2, 32, 170, 340, 1024}}) {{
       if (count > n) continue;
@@ -60,10 +81,12 @@ def _require_sm120():
         raise unittest.SkipTest("Requires SM120")
 
 
-def _case(lengths, *, interleaved=False):
+def _case(lengths, *, interleaved=False, capacity_length=None):
     device = torch.device("cuda", torch.cuda.current_device())
     # Reserve the same per-request capacity for changed row lengths/page mappings.
-    width = max(1, (max(lengths) + 31) // 32)
+    capacity_length = max(lengths) if capacity_length is None else capacity_length
+    assert capacity_length >= max(lengths)
+    width = max(1, (capacity_length + 31) // 32)
     batch, pages = len(lengths), width * len(lengths)
     if interleaved:
         backing = torch.empty((pages, 2 * 32 * 144), dtype=torch.uint8, device=device)
@@ -137,6 +160,13 @@ def _assert_output(actual, expected):
 
 
 def _assert_plan(plan, lengths):
+    if plan.direct:
+        assert len(lengths) == 1
+        assert all(
+            value.numel() == 0
+            for value in (plan.tasks, plan.requests, plan.spans, plan.header)
+        )
+        return
     counts = [(n + 255) // 256 for n in lengths]
     limit = max(1, (sum(counts) + plan.ctas - 1) // plan.ctas)
     if plan.mode == "aligned":
@@ -188,19 +218,38 @@ def _assert_plan(plan, lengths):
     assert plan.spans.cpu().tolist() == spans
 
 
-def _check_changed_graph(mode, interleaved):
+def _check_changed_graph(mode, interleaved, *, direct=False, capacity_length=None):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
     from flashinfer.experimental.xqa_decode_buckets import backend
 
     initial = [0, 1, 31, 32, 33, 255, 256, 257, 511, 512, 513, 0, 8193]
     changed = [513, 0, 257, 1, 0, 512, 31, 256, 33, 255, 32, 8193, 0]
-    queries, data, scales, table, lens = _case(initial, interleaved=interleaved)
+    replay_lengths = (initial, changed, [0] * len(initial), initial)
+    if direct:
+        initial = [512]
+        replay_lengths = [
+            [n]
+            for n in (0, 1, 255, 256, 257, 512, 8193, 65537, capacity_length, 0, 512)
+            if n <= capacity_length
+        ]
+    queries, data, scales, table, lens = _case(
+        initial, interleaved=interleaved, capacity_length=capacity_length
+    )
     plan = create_xqa_decode_bucket_plan(
         lens, page_table_width=table.shape[1], mode=mode
     )
+    assert plan.direct == direct
+    if direct and capacity_length == 512:
+        assert plan.ctas == 2
     print(dict(mode=mode, resources=plan.resources, ctas=plan.ctas), flush=True)
     workspaces = [plan.create_workspace() for _ in queries]
+    assert len({workspace.scratch.data_ptr() for workspace in workspaces}) == len(
+        workspaces
+    )
+    assert len({workspace.semaphores.data_ptr() for workspace in workspaces}) == len(
+        workspaces
+    )
     backings = [
         torch.full(
             (len(initial) + 1, 6, 256), 19, dtype=torch.bfloat16, device=lens.device
@@ -230,14 +279,21 @@ def _check_changed_graph(mode, interleaved):
     ):
         compute_layers()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    no_assignment = (
+        patch.object(
+            backend, "_prepare", side_effect=AssertionError("direct assignment")
+        )
+        if direct
+        else nullcontext()
+    )
+    with no_assignment, torch.cuda.graph(graph):
         plan.prepare()
         compute_layers()
     pointers = [
         value.data_ptr()
         for value in (plan.tasks, plan.requests, plan.spans, plan.header)
     ]
-    for lengths in (initial, changed, [0] * len(initial), initial):
+    for lengths in replay_lengths:
         lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=lens.device))
         table.copy_(table.roll(1, dims=1))
         for query in queries:
@@ -288,9 +344,6 @@ def _check_module_case(lengths, mode):
         bmm2_scale=1.3,
     )
     _assert_plan(plan, lengths)
-    if lengths == [512]:
-        # Two tiles should have two nonempty CTA owners even on a large GPU.
-        assert (plan.spans[:, 1] > plan.spans[:, 0]).sum().item() == 2
     _assert_output(
         actual, _reference(queries[0], data, scales, table, lengths, 0.7 / 16, 1.3)
     )
@@ -298,12 +351,55 @@ def _check_module_case(lengths, mode):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_static_capacity_and_validation(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
+        )
+        spec = importlib.util.spec_from_file_location("xqa_bucket_geometry", path)
+        geometry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(geometry)
+        for batch, width, sms, expected in (
+            (1, 1, 132, 1),
+            (1, 16, 132, 2),
+            (4, 16, 132, 8),
+            (32, 4096, 132, 132),
+            (32, 1, 4, 32),
+        ):
+            self.assertEqual(geometry.plan_ctas(batch, width, sms), expected)
+        for values in (
+            (True, 16, 20),
+            (0, 16, 20),
+            (33, 16, 20),
+            (1, True, 20),
+            (1, 0, 20),
+            (1, -1, 20),
+            (1, geometry.MAX_TABLE_WIDTH + 1, 20),
+            (1, 16, True),
+            (1, 16, 0),
+            (1, 16, 1.5),
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                geometry.plan_ctas(*values)
+
     def test_aligned_boundaries_use_wide_intermediates(self):
         with tempfile.TemporaryDirectory() as directory:
             _check_aligned_boundaries(Path(directory))
 
 
 class BucketGraphTests(unittest.TestCase):
+    def test_direct_replay(self):
+        _require_sm120()
+        for mode in ("persistent", "aligned"):
+            for interleaved in (False, True):
+                for capacity in (512, 131072):
+                    with self.subTest(
+                        mode=mode, interleaved=interleaved, capacity=capacity
+                    ):
+                        _check_changed_graph(
+                            mode, interleaved, direct=True, capacity_length=capacity
+                        )
+
     def test_persistent_interleaved(self):
         _check_changed_graph("persistent", True)
 

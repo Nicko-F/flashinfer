@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Caller-prepared compact work plans and independent native partial workspaces."""
+"""Compact plans, direct B1 geometry, and independent native partial workspaces."""
 
 from dataclasses import dataclass
 import math
@@ -14,27 +14,7 @@ from ...utils import (
     register_fake_op,
 )
 from .jit import get_module
-
-TILE = 256
-MAX_BATCH = 32
-MAX_CTAS = (1 << 31) - 1 - MAX_BATCH
-MAX_TABLE_WIDTH = ((1 << 31) - 1 - (TILE - 1)) // 32
-
-
-def plan_capacity(batch: int, ctas: int, table_width: int) -> int:
-    """Capacity bound for intersections of B request intervals and C buckets."""
-    if (
-        type(batch) is not int
-        or type(ctas) is not int
-        or not 1 <= batch <= MAX_BATCH
-        or not batch <= ctas <= MAX_CTAS
-        or type(table_width) is not int
-        or not 1 <= table_width <= MAX_TABLE_WIDTH
-    ):
-        raise ValueError(
-            "Expected B in [1,32], bounded integer CTA capacity and table width"
-        )
-    return ctas + batch - 1
+from .geometry import plan_capacity, plan_ctas
 
 
 def _tensor(tensor, name, *, dtype, shape, device, contiguous=True, alignment=1):
@@ -105,7 +85,8 @@ def _compute(
     bmm2_scale: float,
     enable_pdl: bool,
 ) -> None:
-    module, _ = get_module(not aligned, q.device)
+    direct = lengths.numel() == 1
+    module, _ = get_module(not aligned and not direct, q.device, direct=direct)
     module.run(
         q,
         k,
@@ -166,7 +147,10 @@ class BucketWorkspace:
 class BucketPlan:
     """Fixed buffer addresses; refresh device contents once per forward.
 
-    Call prepare() once per forward after updating lengths, before its consumers.
+    For B>1 call prepare() once per forward after updating lengths, before its
+    consumers. B=1 uses direct geometry inside each compute; prepare() is a no-op
+    and tasks/requests/spans/header are empty, unused tensors. Both mode names
+    select that same one-task-per-CTA specialization for B=1.
     Compatible layers share the same request ordering and lengths. Replays and
     refreshes must be ordered on the same stream or by explicit CUDA events.
     Separate concurrent computes require independent BucketWorkspace instances.
@@ -182,8 +166,11 @@ class BucketPlan:
     mode: str
     scratch_bytes: int
     resources: tuple
+    direct: bool
 
     def prepare(self):
+        if self.direct:
+            return self
         with torch.cuda.device(self.lengths.device):
             _prepare(
                 self.lengths,
@@ -220,21 +207,24 @@ def create_plan(seq_lens, *, page_table_width, mode="persistent"):
     if get_compute_capability(device) != (12, 0):
         raise ValueError("XQA Decode buckets currently support SM120")
     batch = seq_lens.numel()
-    # Zero rows have one output owner each, even on a device with fewer SMs than B.
-    ctas = max(get_device_sm_count(device), batch)
+    ctas = plan_ctas(batch, page_table_width, get_device_sm_count(device))
     capacity = plan_capacity(batch, ctas, page_table_width)
-    module, resources = get_module(mode == "persistent", device)
+    direct = batch == 1
+    module, resources = get_module(
+        mode == "persistent" and not direct, device, direct=direct
+    )
     plan = BucketPlan(
         seq_lens,
-        torch.empty((capacity, 4), dtype=torch.int32, device=device),
-        torch.empty((batch, 2), dtype=torch.int32, device=device),
-        torch.empty((ctas, 2), dtype=torch.int32, device=device),
-        torch.empty(4, dtype=torch.int32, device=device),
+        torch.empty((0 if direct else capacity, 4), dtype=torch.int32, device=device),
+        torch.empty((0 if direct else batch, 2), dtype=torch.int32, device=device),
+        torch.empty((0 if direct else ctas, 2), dtype=torch.int32, device=device),
+        torch.empty(0 if direct else 4, dtype=torch.int32, device=device),
         ctas,
         page_table_width,
         mode,
         module.scratch_bytes(capacity),
         resources,
+        direct,
     )
     # The initial generation is usable immediately. Later forwards refresh it explicitly.
     return plan.prepare()

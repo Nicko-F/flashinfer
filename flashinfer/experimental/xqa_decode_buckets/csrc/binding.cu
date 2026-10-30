@@ -21,10 +21,19 @@ buckets::PlanParams plan_params(TensorView lengths, TensorView tasks, TensorView
   int64_t capacity = ctas + batch - 1;
   auto device = lengths.device();
   check_tensor(lengths, dl_int32, device, batch);
+#if FLASHINFER_XQA_DIRECT_TASKS
+  TVM_FFI_ICHECK_EQ(batch, 1);
+  check_tensor(tasks, dl_int32, device, 0);
+  check_tensor(requests, dl_int32, device, 0);
+  check_tensor(spans, dl_int32, device, 0);
+  check_tensor(header, dl_int32, device, 0);
+#else
+  TVM_FFI_ICHECK_GT(batch, 1);
   check_tensor(tasks, dl_int32, device, capacity * 4);
   check_tensor(requests, dl_int32, device, batch * 2);
   check_tensor(spans, dl_int32, device, ctas * 2);
   check_tensor(header, dl_int32, device, 4);
+#endif
 #if FLASHINFER_XQA_PERSISTENT_TASKS
   TVM_FFI_ICHECK(!aligned);
 #endif
@@ -38,10 +47,14 @@ buckets::PlanParams plan_params(TensorView lengths, TensorView tasks, TensorView
 
 void bucket_plan(TensorView lengths, TensorView tasks, TensorView requests, TensorView spans,
                  TensorView header, int64_t ctas, bool aligned) {
+#if FLASHINFER_XQA_DIRECT_TASKS
+  TVM_FFI_ICHECK(false) << "Direct B1 plans do not consume task descriptors";
+#else
   auto p = plan_params(lengths, tasks, requests, spans, header, ctas, aligned);
   ffi::CUDADeviceGuard device_guard(lengths.device().device_id);
   buckets::assign<<<1, 128, 0, get_stream(lengths.device())>>>(p);
   checkCuda(cudaPeekAtLastError());
+#endif
 }
 
 int64_t bucket_scratch_bytes(int64_t capacity) {

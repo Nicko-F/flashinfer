@@ -53,6 +53,9 @@ static_assert(ctaSize == 256 && ctaShapeInWarps.x == 4 && ctaShapeInWarps.y == 1
               gemm1NbWarpGrps == 1 && nbHeadSplits == 1 && headElems == 256 &&
               headGrpSize == 6 && SPEC_DEC == 0 && BEAM_WIDTH == 1 && USE_CUSTOM_BARRIER == 1,
               "Task/barrier ownership supports only the declared q1/Q6/KV1/D256 core");
+static_assert(ctaTile.x == Tile);
+static_assert(!FLASHINFER_XQA_DIRECT_TASKS || !FLASHINFER_XQA_PERSISTENT_TASKS,
+              "Direct B1 uses the nonpersistent one-task core");
 static_assert(sizeof(SharedMem::Barrier) == 8 &&
               (sizeof(SharedMem::xBarriers) / sizeof(CtaBarrierPair)) * 2 +
                   ctaShapeInWarps.y + SharedMem::nbOtherBarriers == 12);
@@ -137,7 +140,17 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
     for (int i = tid; i < 6 * 256; i += 256) p.output[owner * 6 * 256 + i] = __float2bfloat16_rn(0.f);
     if (tid == 0) p.semaphores[owner] = 0;
   }
-#if FLASHINFER_XQA_PERSISTENT_TASKS
+#if FLASHINFER_XQA_DIRECT_TASKS
+  // Every active CTA derives the same live scratch layout. Descriptors are
+  // deliberately absent; changing length during replay cannot strand metadata.
+  int tiles = direct_tile_count(plan.lengths[0]);
+  int total_slots = direct_split_count(plan.lengths[0], plan.ctas);
+  if (owner >= total_slots) return;  // Includes zero length, before division.
+  int slot = owner;
+  XQABucketTask task{0, aligned_boundary(owner, tiles, total_slots),
+                      aligned_boundary(owner + 1, tiles, total_slots), 1};
+  XQABucketRange range{0, total_slots};
+#elif FLASHINFER_XQA_PERSISTENT_TASKS
   XQABucketSpan span = plan.buckets[owner];
   bool reused = false;
   for (int slot = span.begin; slot < span.end; ++slot) {
@@ -145,11 +158,14 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
   int slot = owner;
   if (slot >= plan.header[1]) return;
 #endif
+#if !FLASHINFER_XQA_DIRECT_TASKS
     XQABucketTask task = plan.tasks[slot];
     XQABucketRange range = plan.requests[task.request];
+    int total_slots = plan.header[1];
+#endif
     XQATaskContext context{uint32_t(task.request), uint32_t(slot), uint32_t(task.begin),
         uint32_t(task.end), uint32_t(range.begin), uint32_t(range.count),
-        uint32_t(plan.header[1]), p.qscale, p.vscale,
+        uint32_t(total_slots), p.qscale, p.vscale,
 #if FLASHINFER_XQA_PERSISTENT_TASKS
         uint32_t(reused)
 #else

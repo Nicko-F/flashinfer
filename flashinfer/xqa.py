@@ -48,10 +48,15 @@ def create_xqa_decode_bucket_plan(
     retains this storage; its contents may change, while its address and shape
     remain fixed. Call ``plan.prepare()`` once after updating lengths for each
     subsequent forward, before all attention layers sharing the request order.
+    For ``B=1``, ``prepare()`` is a no-op: each compute derives contiguous tile
+    boundaries directly from the live device length. Both mode names use that
+    same direct one-task-per-CTA path; its task/header tensors are empty.
 
     ``mode="persistent"`` intersects request intervals with global KV-work
     buckets; ``mode="aligned"`` balances fanout within each request. Compute
-    consumes the prepared tables and never launches assignment implicitly.
+    consumes the prepared tables for ``B>1`` and never launches assignment
+    implicitly. The cold CTA cap uses the page-table capacity, not a device
+    length readback, so wide reserved tables can retain a larger grid.
     Allocate one ``plan.create_workspace()`` per concurrent compute; ordered
     layers may share a workspace. Plan refresh, compute and Graph replay must
     be ordered on one stream or with explicit CUDA events.
@@ -81,7 +86,7 @@ def xqa_decode_with_buckets(
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Run q1 native XQA math using an explicitly refreshed bucket plan.
+    """Run q1 native XQA math using an experimental work plan.
 
     Supports SM120 BF16 Q/output ``[B,6,256]``, one local KV head, NHD
     page32 NVFP4 K/V ``[pages,32,1,128]`` and E4M3 block scales
@@ -89,6 +94,10 @@ def xqa_decode_with_buckets(
     ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
     reached by live lengths must address allocated cache pages. Zero-length
     rows write zeros. There are no sliding windows, sinks or speculative rows.
+
+    For ``B=1``, compute derives split geometry from the live device length;
+    ``plan.prepare()`` is a no-op. For ``B>1``, refresh the prepared descriptors
+    after updating lengths and before their compute consumers.
 
     ``bmm1_scale`` directly scales QK before softmax; ``bmm2_scale`` directly
     scales V/output. They are independent effective scales. The output and

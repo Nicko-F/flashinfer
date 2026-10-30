@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runnable module example; --benchmark counts one plan per compatible layer window."""
+"""Runnable module example; benchmarks include assignment for B>1 windows."""
 
 import argparse
 import statistics
@@ -18,6 +18,9 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--capacity-length", type=int, help="Reserved table capacity in tokens"
+    )
+    parser.add_argument(
         "--mode", choices=("persistent", "aligned"), default="persistent"
     )
     parser.add_argument("--benchmark", action="store_true")
@@ -30,13 +33,16 @@ def main():
     lengths = [int(n) for n in args.lengths.split(",")]
     if not 1 <= len(lengths) <= 32 or min(lengths) < 1 or args.layers < 1:
         parser.error("Use 1-32 positive lengths and at least one layer")
+    capacity = max(lengths) if args.capacity_length is None else args.capacity_length
+    if capacity < max(lengths):
+        parser.error("--capacity-length must cover every live length")
     device = torch.device(args.device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
     counts = [(n + 31) // 32 for n in lengths]
-    width = max(counts)
+    width = (capacity + 31) // 32
     table = torch.zeros((len(lengths), width), dtype=torch.int32, device=device)
     offset = 0
     for row, count in enumerate(counts):
@@ -128,26 +134,55 @@ def main():
             mode=args.mode,
             seed=args.seed,
             resources=plan.resources,
-            assignment_per_window=1,
+            capacity_length=width * 32,
+            direct=plan.direct,
+            assignment_per_window=0 if plan.direct else 1,
         ),
         flush=True,
     )
     if args.diagnose:
-        header = plan.header.cpu().tolist()
+        if plan.direct:
+            # Explicitly derived outside timing; not a profiler launch record.
+            live = plan.lengths.cpu().tolist()[0]
+            tiles = (live + 255) // 256
+            parts = min(tiles, plan.ctas)
+            topology = dict(
+                source="derived from live device length outside timed region",
+                representation="direct_b1_empty_descriptors",
+                live_length=live,
+                tasks_derived=[
+                    [0, i * tiles // parts, (i + 1) * tiles // parts, 1]
+                    for i in range(parts)
+                ],
+                grid_ctas=plan.ctas,
+                nonempty_tile_ctas_derived=parts,
+            )
+            print(
+                dict(
+                    arm="assign_only",
+                    gpu_launches=0,
+                    reason="direct prepare is a no-op",
+                ),
+                flush=True,
+            )
+        else:
+            header = plan.header.cpu().tolist()
+            topology = dict(
+                source="prepared device descriptors",
+                header=header,
+                tasks=plan.tasks[: header[1]].cpu().tolist(),
+                requests=plan.requests.cpu().tolist(),
+                grid_ctas=plan.ctas,
+                active_ctas=header[2],
+            )
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-        splits = min(max(1, sms // len(lengths)), (max(lengths) + 255) // 256)
+        splits = min(max(1, sms // len(lengths)), (width * 32 + 255) // 256)
         print(
             dict(
-                plan_topology=dict(
-                    header=header,
-                    tasks=plan.tasks[: header[1]].cpu().tolist(),
-                    requests=plan.requests.cpu().tolist(),
-                    grid_ctas=plan.ctas,
-                    active_ctas=header[2],
-                ),
+                plan_topology=topology,
                 native_launch_derived=dict(
                     source="csrc/xqa/mha.cu:3211-3222",
-                    formula="splits=min(max(1,SMs/(B*KVheads)),ceil(maxlen/256))",
+                    formula="splits=min(max(1,SMs/(B*KVheads)),ceil(table_width*32/256))",
                     sm_count=sms,
                     kv_heads=1,
                     grid=[splits, 1, len(lengths)],
@@ -168,9 +203,10 @@ def main():
             ("native_after", native),
         )
         if args.diagnose:
+            assignment_windows = () if plan.direct else (("assign_only", plan.prepare),)
             windows = (
                 ("native_before", native),
-                ("assign_only", plan.prepare),
+                *assignment_windows,
                 ("compute_only", compute),
                 ("assign_and_compute", candidate),
                 ("native_after", native),
