@@ -20,5 +20,9 @@ XQA_BUCKET_HOST_DEVICE constexpr int aligned_boundary(int ordinal, int tiles, in
   // Table capacity is independent of live length; ordinal*tiles can exceed int32.
   return int(int64_t(ordinal) * tiles / count);
 }
+XQA_BUCKET_HOST_DEVICE constexpr int direct_boundary(int ordinal, int tiles, int count) {
+  // One tile per owner needs no runtime int64 division.
+  return tiles == count ? ordinal : aligned_boundary(ordinal, tiles, count);
+}
 }  // namespace flashinfer::xqa_buckets
 #undef XQA_BUCKET_HOST_DEVICE

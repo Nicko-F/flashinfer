@@ -2,9 +2,10 @@
 
 This backend uses the native XQA loader, BF16 QK/PV arithmetic, FP32 softmax and
 accumulation, and normalized-partial last-CTA merge. A separately prepared GPU
-work plan balances KV tiles across requests. For B=1, the compute kernel derives
-its task interval directly from the live device length, without a separate
-assignment launch. Native XQA behavior is unchanged.
+work plan balances KV tiles across requests. For B=1, or when every potential KV
+tile fits the device CTA budget, the compute kernel derives its task interval
+directly from live device lengths, without a separate assignment launch. Native
+XQA behavior is unchanged.
 This port changes task ownership, not the native MMA operand orientation; it does
 not implement a separate KQ-transposed/V-transposed-P-transposed compute core.
 
@@ -62,19 +63,27 @@ for q, k, v, ks, vs, out in compatible_attention_layers:
     )
 ```
 
-For B>1, the initial factory call prepares one generation. `prepare()` refreshes
-task contents without replacing pointers, and compute consumes those tables.
-For B=1, `plan.direct` is true, task/request/span/header tensors are deliberately
-empty, and `prepare()` is a no-op. Each active CTA derives one contiguous interval
-from the current device length; no task table is materialized or read. The direct
-specialization uses the same native XQA arithmetic and partial-merge protocol,
-not a call back to the native public API. Zero length produces zero output.
+The factory selects `plan.direct` when `B == 1` or
+`B * ceil(width * 32 / 256) <= SMs`. This is a static capacity condition, not a
+measured-length heuristic. Otherwise the initial factory call prepares one
+generation and `prepare()` refreshes task contents without replacing pointers.
+
+For direct plans, task/request/span/header tensors are deliberately empty and
+`prepare()` is a no-op. The grid is `(CTAs / B, 1, B)`; its Z coordinate identifies
+the request, with no task-table lookup. For B>1 each active CTA handles one tile,
+and request-local partial ranges reserve slots from the static per-request cap.
+For B=1, live splits can each cover multiple tiles for a long prefix; the merge
+uses only its live partial count. One-tile intervals bypass general integer
+boundary division. The direct specialization uses the same native XQA arithmetic
+and partial-merge protocol, not a call back to the native public API. The first
+CTA of an empty row clears its output; all excess owners return.
 Compatible layers
 share request order and live lengths, but retain independent Q/cache/output.
 `mode="persistent"` uses global interval buckets with multiple tasks per CTA;
 `mode="aligned"` minimizes balanced request-local fanout and launches one task
-per CTA. Both modes select the same direct specialization for B=1. For B>1 the
-modes remain explicit controls, not a validated load-dependent routing policy.
+per CTA. Both modes select the same specialization when `plan.direct` is true.
+For other shapes the modes remain explicit controls, not a validated
+load-dependent routing policy.
 
 Plans, workspace and referenced tensors must outlive every asynchronous consumer
 and captured Graph. Sequential layers may share scratch/counters after the prior
@@ -103,7 +112,8 @@ python examples/xqa_decode_buckets.py --lengths 131072,4096,4096,4096 --layers 1
 ```
 
 The example compares native and bucket windows with the same caller-owned inputs,
-and counts one assignment per layer window for B>1, zero for B=1. Use
+and counts one assignment per layer window for prepared plans, zero for direct
+plans. Use
 `--capacity-length` to distinguish reserved table capacity from live lengths.
 It is not a model or HTTP benchmark.
 The tests cover actual task ownership, changed input/length/page-table Graph
@@ -203,6 +213,39 @@ The static-cap B4 case has eight launched CTAs on both sides but still regresses
 17.8%; assignment and the persistent compute path remain costs. The skew anchor
 retains about 9.66x, without a new service or general-load claim.
 
-These results motivate testing direct geometry when all potential tiles fit the
-device CTA budget, plus removing redundant boundary division when each active
-CTA owns exactly one tile. Those extensions are not included in this checkpoint.
+These results motivated direct geometry when all potential tiles fit the device
+CTA budget, plus removing redundant boundary division when each active CTA owns
+exactly one tile. Those extensions were not included in that checkpoint.
+
+## Capacity-fitting direct tasks (2026-10-30)
+
+The next change uses the static direct eligibility and `(tile, request)` grid
+described above. All eight test groups passed again, including added B3, B4 and
+B32 direct Graph replay with empty/mixed rows, non-power-of-two tile capacity,
+page updates, both cache layouts and both mode labels. The direct kernel reports
+186 registers, 70,272 bytes shared memory, 112 stack bytes, one barrier and one
+resident CTA per SM, with zero spills. Prepared kernels retain their prior
+resources. No native fallback or precision change is involved.
+
+Four affected cases were retimed using the same paired two-layer Graph protocol.
+Each complete candidate window now has zero assignment launches.
+
+| Live lengths | Table capacity per request | Native before / after (us) | Complete candidate (us) |
+| --- | ---: | ---: | ---: |
+| 256 | 256 | 21.261 / 21.261 | 21.469 |
+| 512 | 512 | 23.691 / 23.566 | 23.822 |
+| 512 | 131072 | 70.822 / 70.822 | 23.310 |
+| 4 x 512 | 512 | 23.718 / 23.581 | 23.874 |
+
+The three tight cases still regress 0.8-1.0% against the mean of their native
+controls. B4's earlier 17.8% gap is reduced to 0.95%; this is near parity in these
+measurements, not a universal non-regression guarantee. Wide-table B1 is about
+3.04x faster. Short-work geometry and multi-request direct dispatch changed
+together, so their individual contributions are not causally isolated here.
+
+Prepared skewed/uniform shapes were correctness-tested but not retimed in this
+last change; their earlier timings remain explicitly earlier evidence. Wide
+multi-request tables, vLLM metadata/capture integration and model/service timing
+still require validation. In particular the wide-table B1 result is sensitive to
+the actual capacity exposed by the framework and cannot be assumed for every
+serving configuration. No transposed Compute implementation is claimed.

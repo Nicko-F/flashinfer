@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compact plans, direct B1 geometry, and independent native partial workspaces."""
+"""Compact plans, direct tile geometry, and independent native partial workspaces."""
 
 from dataclasses import dataclass
 import math
@@ -14,7 +14,7 @@ from ...utils import (
     register_fake_op,
 )
 from .jit import get_module
-from .geometry import plan_capacity, plan_ctas
+from .geometry import plan_capacity, plan_geometry
 
 
 def _tensor(tensor, name, *, dtype, shape, device, contiguous=True, alignment=1):
@@ -85,7 +85,8 @@ def _compute(
     bmm2_scale: float,
     enable_pdl: bool,
 ) -> None:
-    direct = lengths.numel() == 1
+    # Empty headers are the factory's explicit static direct-plan representation.
+    direct = header.numel() == 0
     module, _ = get_module(not aligned and not direct, q.device, direct=direct)
     module.run(
         q,
@@ -147,10 +148,11 @@ class BucketWorkspace:
 class BucketPlan:
     """Fixed buffer addresses; refresh device contents once per forward.
 
-    For B>1 call prepare() once per forward after updating lengths, before its
-    consumers. B=1 uses direct geometry inside each compute; prepare() is a no-op
-    and tasks/requests/spans/header are empty, unused tensors. Both mode names
-    select that same one-task-per-CTA specialization for B=1.
+    Direct plans use geometry inside compute; prepare() is a no-op and all four
+    descriptor tensors are empty. They apply to B=1 or when the static table's
+    total tile bound fits the device SM count. Both mode names select the same
+    one-task-per-CTA specialization for direct plans. Otherwise call prepare()
+    once per forward after updating lengths, before its compute consumers.
     Compatible layers share the same request ordering and lengths. Replays and
     refreshes must be ordered on the same stream or by explicit CUDA events.
     Separate concurrent computes require independent BucketWorkspace instances.
@@ -207,9 +209,8 @@ def create_plan(seq_lens, *, page_table_width, mode="persistent"):
     if get_compute_capability(device) != (12, 0):
         raise ValueError("XQA Decode buckets currently support SM120")
     batch = seq_lens.numel()
-    ctas = plan_ctas(batch, page_table_width, get_device_sm_count(device))
+    ctas, direct = plan_geometry(batch, page_table_width, get_device_sm_count(device))
     capacity = plan_capacity(batch, ctas, page_table_width)
-    direct = batch == 1
     module, resources = get_module(
         mode == "persistent" and not direct, device, direct=direct
     )

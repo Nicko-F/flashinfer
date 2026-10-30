@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runnable module example; benchmarks include assignment for B>1 windows."""
+"""Runnable module example; benchmarks include assignment for prepared plans."""
 
 import argparse
 import statistics
@@ -143,19 +143,35 @@ def main():
     if args.diagnose:
         if plan.direct:
             # Explicitly derived outside timing; not a profiler launch record.
-            live = plan.lengths.cpu().tolist()[0]
-            tiles = (live + 255) // 256
-            parts = min(tiles, plan.ctas)
+            live_lengths = plan.lengths.cpu().tolist()
+            per_request = plan.ctas // len(live_lengths)
+            request_bounds = []
+            for request, live in enumerate(live_lengths):
+                tiles = (live + 255) // 256
+                parts = min(tiles, per_request) if len(live_lengths) == 1 else tiles
+                base = request * per_request
+                request_bounds.append(
+                    dict(
+                        request=request,
+                        live_length=live,
+                        partial_begin=base,
+                        partial_count=parts,
+                        total_slots=parts if len(live_lengths) == 1 else plan.ctas,
+                        intervals=[
+                            [i * tiles // parts, (i + 1) * tiles // parts]
+                            for i in range(parts)
+                        ],
+                    )
+                )
             topology = dict(
                 source="derived from live device length outside timed region",
-                representation="direct_b1_empty_descriptors",
-                live_length=live,
-                tasks_derived=[
-                    [0, i * tiles // parts, (i + 1) * tiles // parts, 1]
-                    for i in range(parts)
-                ],
+                representation="direct_empty_descriptors",
+                request_bounds_derived=request_bounds,
+                grid=[per_request, 1, len(live_lengths)],
                 grid_ctas=plan.ctas,
-                nonempty_tile_ctas_derived=parts,
+                nonempty_tile_ctas_derived=sum(
+                    r["partial_count"] for r in request_bounds
+                ),
             )
             print(
                 dict(

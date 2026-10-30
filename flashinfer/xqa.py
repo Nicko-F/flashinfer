@@ -48,14 +48,16 @@ def create_xqa_decode_bucket_plan(
     retains this storage; its contents may change, while its address and shape
     remain fixed. Call ``plan.prepare()`` once after updating lengths for each
     subsequent forward, before all attention layers sharing the request order.
-    For ``B=1``, ``prepare()`` is a no-op: each compute derives contiguous tile
-    boundaries directly from the live device length. Both mode names use that
-    same direct one-task-per-CTA path; its task/header tensors are empty.
+    A direct plan is selected for ``B=1`` or when the static total tile bound
+    ``B * ceil(page_table_width * 32 / 256)`` fits the device SM count. For these
+    plans ``prepare()`` is a no-op: compute derives contiguous boundaries from
+    live device lengths. Both mode names select the same direct one-task-per-CTA
+    path; its descriptor tensors are empty and no assignment kernel is launched.
 
     ``mode="persistent"`` intersects request intervals with global KV-work
     buckets; ``mode="aligned"`` balances fanout within each request. Compute
-    consumes the prepared tables for ``B>1`` and never launches assignment
-    implicitly. The cold CTA cap uses the page-table capacity, not a device
+    consumes the prepared tables otherwise and never launches assignment
+    implicitly. Static selection and the CTA cap use table capacity, not a device
     length readback, so wide reserved tables can retain a larger grid.
     Allocate one ``plan.create_workspace()`` per concurrent compute; ordered
     layers may share a workspace. Plan refresh, compute and Graph replay must
@@ -95,9 +97,10 @@ def xqa_decode_with_buckets(
     reached by live lengths must address allocated cache pages. Zero-length
     rows write zeros. There are no sliding windows, sinks or speculative rows.
 
-    For ``B=1``, compute derives split geometry from the live device length;
-    ``plan.prepare()`` is a no-op. For ``B>1``, refresh the prepared descriptors
-    after updating lengths and before their compute consumers.
+    Direct plans derive split geometry from live device lengths and have a
+    no-op ``prepare()``. For prepared plans, refresh descriptors after updating
+    lengths and before their compute consumers. Selection uses static capacity
+    and never reads lengths back to the host.
 
     ``bmm1_scale`` directly scales QK before softmax; ``bmm2_scale`` directly
     scales V/output. They are independent effective scales. The output and

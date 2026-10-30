@@ -23,12 +23,13 @@ def plan_capacity(batch: int, ctas: int, table_width: int) -> int:
     return ctas + batch - 1
 
 
-def plan_ctas(batch: int, table_width: int, sm_count: int) -> int:
-    """Cap cold capacity by table bounds while reserving zero-row owners."""
+def plan_geometry(batch: int, table_width: int, sm_count: int) -> tuple[int, bool]:
+    """Return checked CTA capacity and static direct-path eligibility."""
     plan_capacity(batch, batch, table_width)
     if type(sm_count) is not int or not 1 <= sm_count <= MAX_CTAS:
         raise ValueError("Expected a bounded positive integer SM count")
     # All inputs were checked before products or rounding. Live lengths stay
     # on device; a wide reserved table may therefore retain a larger grid.
     tiles_per_request = (table_width * 32 + TILE - 1) // TILE
-    return max(batch, min(sm_count, batch * tiles_per_request))
+    total_tiles = batch * tiles_per_request
+    return max(batch, min(sm_count, total_tiles)), batch == 1 or total_tiles <= sm_count

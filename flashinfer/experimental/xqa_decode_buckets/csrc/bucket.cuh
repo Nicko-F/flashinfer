@@ -55,7 +55,7 @@ static_assert(ctaSize == 256 && ctaShapeInWarps.x == 4 && ctaShapeInWarps.y == 1
               "Task/barrier ownership supports only the declared q1/Q6/KV1/D256 core");
 static_assert(ctaTile.x == Tile);
 static_assert(!FLASHINFER_XQA_DIRECT_TASKS || !FLASHINFER_XQA_PERSISTENT_TASKS,
-              "Direct B1 uses the nonpersistent one-task core");
+              "Direct geometry uses the nonpersistent one-task core");
 static_assert(sizeof(SharedMem::Barrier) == 8 &&
               (sizeof(SharedMem::xBarriers) / sizeof(CtaBarrierPair)) * 2 +
                   ctaShapeInWarps.y + SharedMem::nbOtherBarriers == 12);
@@ -136,20 +136,31 @@ __global__ __launch_bounds__(256, 1) void compute(ComputeParams p) {
 #endif
   auto const& plan = p.plan;
   int tid = threadIdx.x + 128 * threadIdx.z, owner = blockIdx.x;
+#if FLASHINFER_XQA_DIRECT_TASKS
+  int request = blockIdx.z;
+  if (owner == 0 && plan.lengths[request] == 0) {
+    for (int i = tid; i < 6 * 256; i += 256) p.output[request * 6 * 256 + i] = __float2bfloat16_rn(0.f);
+    if (tid == 0) p.semaphores[request] = 0;
+  }
+#else
   if (owner < plan.batch && plan.lengths[owner] == 0) {
     for (int i = tid; i < 6 * 256; i += 256) p.output[owner * 6 * 256 + i] = __float2bfloat16_rn(0.f);
     if (tid == 0) p.semaphores[owner] = 0;
   }
+#endif
 #if FLASHINFER_XQA_DIRECT_TASKS
   // Every active CTA derives the same live scratch layout. Descriptors are
   // deliberately absent; changing length during replay cannot strand metadata.
-  int tiles = direct_tile_count(plan.lengths[0]);
-  int total_slots = direct_split_count(plan.lengths[0], plan.ctas);
-  if (owner >= total_slots) return;  // Includes zero length, before division.
-  int slot = owner;
-  XQABucketTask task{0, aligned_boundary(owner, tiles, total_slots),
-                      aligned_boundary(owner + 1, tiles, total_slots), 1};
-  XQABucketRange range{0, total_slots};
+  int length = plan.lengths[request];
+  int tiles = direct_tile_count(length);
+  int count = plan.batch == 1 ? direct_split_count(length, gridDim.x) : tiles;
+  if (owner >= count) return;  // Includes zero length, before division.
+  int base = request * gridDim.x;
+  int total_slots = plan.batch == 1 ? count : plan.ctas;
+  int slot = base + owner;
+  XQABucketTask task{request, direct_boundary(owner, tiles, count),
+                            direct_boundary(owner + 1, tiles, count), 1};
+  XQABucketRange range{base, count};
 #elif FLASHINFER_XQA_PERSISTENT_TASKS
   XQABucketSpan span = plan.buckets[owner];
   bool reused = false;

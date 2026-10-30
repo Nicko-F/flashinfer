@@ -30,10 +30,13 @@ def _check_aligned_boundaries(tmp_path):
 #include <initializer_list>
 int main() {{
   using flashinfer::xqa_buckets::aligned_boundary;
+  using flashinfer::xqa_buckets::direct_boundary;
   using flashinfer::xqa_buckets::direct_split_count;
   using flashinfer::xqa_buckets::direct_tile_count;
   assert(direct_split_count(0, 2) == 0);
   assert(direct_split_count(512, 170) == 2);
+  assert(direct_boundary(13, 512, 512) == 13);
+  assert(direct_boundary(512, 512, 512) == 512);
   for (int length : {{0, 1, 255, 256, 257, 512, 8193, 2147483647}}) {{
     for (int cap : {{1, 2, 32, 170, 1024}}) {{
       int tiles = direct_tile_count(length), count = direct_split_count(length, cap);
@@ -55,6 +58,7 @@ int main() {{
       int previous = 0;
       for (int i = 0; i <= count; ++i) {{
         int boundary = aligned_boundary(i, n, count);
+        assert(direct_boundary(i, n, count) == boundary);
         assert(boundary == int(int64_t(i) * n / count));
         assert(boundary >= previous && boundary <= n);
         if (i) assert(boundary > previous);
@@ -161,7 +165,7 @@ def _assert_output(actual, expected):
 
 def _assert_plan(plan, lengths):
     if plan.direct:
-        assert len(lengths) == 1
+        assert plan.ctas % len(lengths) == 0
         assert all(
             value.numel() == 0
             for value in (plan.tasks, plan.requests, plan.spans, plan.header)
@@ -218,7 +222,9 @@ def _assert_plan(plan, lengths):
     assert plan.spans.cpu().tolist() == spans
 
 
-def _check_changed_graph(mode, interleaved, *, direct=False, capacity_length=None):
+def _check_changed_graph(
+    mode, interleaved, *, direct=False, capacity_length=None, direct_batch=1
+):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
     from flashinfer.experimental.xqa_decode_buckets import backend
@@ -226,13 +232,31 @@ def _check_changed_graph(mode, interleaved, *, direct=False, capacity_length=Non
     initial = [0, 1, 31, 32, 33, 255, 256, 257, 511, 512, 513, 0, 8193]
     changed = [513, 0, 257, 1, 0, 512, 31, 256, 33, 255, 32, 8193, 0]
     replay_lengths = (initial, changed, [0] * len(initial), initial)
-    if direct:
+    if direct and direct_batch == 1:
         initial = [512]
         replay_lengths = [
             [n]
             for n in (0, 1, 255, 256, 257, 512, 8193, 65537, capacity_length, 0, 512)
             if n <= capacity_length
         ]
+    elif direct:
+        if direct_batch == 4:
+            initial = [512, 257, 1, 0]
+            replay_lengths = (
+                initial,
+                [0, 512, 256, 1],
+                [255, 0, 257, 512],
+                [512, 1, 0, 256],
+                [0] * 4,
+                initial,
+            )
+        elif direct_batch == 3:
+            initial = [0, 257, 513]
+            replay_lengths = (initial, [513, 0, 1], [1, 256, 0], [0] * 3, initial)
+        else:
+            assert direct_batch == 32
+            initial = [0, 1, 255, 256] * 8
+            replay_lengths = (initial, [256, 0, 1, 255] * 8, [0] * 32, initial)
     queries, data, scales, table, lens = _case(
         initial, interleaved=interleaved, capacity_length=capacity_length
     )
@@ -241,7 +265,7 @@ def _check_changed_graph(mode, interleaved, *, direct=False, capacity_length=Non
     )
     assert plan.direct == direct
     if direct and capacity_length == 512:
-        assert plan.ctas == 2
+        assert plan.ctas == 2 * len(initial)
     print(dict(mode=mode, resources=plan.resources, ctas=plan.ctas), flush=True)
     workspaces = [plan.create_workspace() for _ in queries]
     assert len({workspace.scratch.data_ptr() for workspace in workspaces}) == len(
@@ -296,6 +320,8 @@ def _check_changed_graph(mode, interleaved, *, direct=False, capacity_length=Non
     for lengths in replay_lengths:
         lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=lens.device))
         table.copy_(table.roll(1, dims=1))
+        if direct and len(initial) > 1:
+            table.copy_(table.roll(1, dims=0))
         for query in queries:
             query.normal_(0, 0.25)
         inputs = [*queries, *data, *scales, table, lens]
@@ -366,7 +392,18 @@ class GeometryTests(unittest.TestCase):
             (32, 4096, 132, 132),
             (32, 1, 4, 32),
         ):
-            self.assertEqual(geometry.plan_ctas(batch, width, sms), expected)
+            self.assertEqual(geometry.plan_geometry(batch, width, sms)[0], expected)
+        for batch, width, sms, expected in (
+            (1, 4096, 132, (132, True)),
+            (4, 16, 8, (8, True)),
+            (4, 16, 7, (7, False)),
+            (32, 1, 4, (32, False)),
+            (4, 264, 132, (132, True)),
+            (4, 265, 132, (132, False)),
+            (3, 17, 9, (9, True)),
+            (3, 17, 8, (8, False)),
+        ):
+            self.assertEqual(geometry.plan_geometry(batch, width, sms), expected)
         for values in (
             (True, 16, 20),
             (0, 16, 20),
@@ -380,7 +417,7 @@ class GeometryTests(unittest.TestCase):
             (1, 16, 1.5),
         ):
             with self.subTest(values=values), self.assertRaises(ValueError):
-                geometry.plan_ctas(*values)
+                geometry.plan_geometry(*values)
 
     def test_aligned_boundaries_use_wide_intermediates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -398,6 +435,17 @@ class BucketGraphTests(unittest.TestCase):
                     ):
                         _check_changed_graph(
                             mode, interleaved, direct=True, capacity_length=capacity
+                        )
+                for batch, capacity in ((4, 512), (3, 513), (32, 256)):
+                    with self.subTest(
+                        mode=mode, interleaved=interleaved, direct_batch=batch
+                    ):
+                        _check_changed_graph(
+                            mode,
+                            interleaved,
+                            direct=True,
+                            capacity_length=capacity,
+                            direct_batch=batch,
                         )
 
     def test_persistent_interleaved(self):
