@@ -111,6 +111,7 @@ exclude = [
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
+"flashinfer.experimental.xqa_decode_buckets" = ["csrc/**", "README.md"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
@@ -367,3 +368,4 @@ ignore = [
 "flashinfer/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
 "tests/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
 "benchmarks/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
+

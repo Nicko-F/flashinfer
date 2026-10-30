@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.page import xqa_mla_trace, xqa_trace
 from .jit.xqa import (
     gen_xqa_module,
@@ -35,6 +35,83 @@ from .utils import (
     get_compute_capability,
     device_support_pdl,
 )
+
+
+@flashinfer_experimental_api(feature="SM120 NVFP4 Decode bucket planning")
+def create_xqa_decode_bucket_plan(
+    seq_lens: torch.Tensor, *, page_table_width: int, mode: str = "persistent"
+):
+    """Allocate and prepare an experimental reusable q1 Decode work plan.
+
+    ``seq_lens`` is contiguous CUDA int32 ``[B]`` storage with ``1 <= B <= 32``.
+    Its values must stay between zero and ``page_table_width * 32``. The plan
+    retains this storage; its contents may change, while its address and shape
+    remain fixed. Call ``plan.prepare()`` once after updating lengths for each
+    subsequent forward, before all attention layers sharing the request order.
+
+    ``mode="persistent"`` intersects request intervals with global KV-work
+    buckets; ``mode="aligned"`` balances fanout within each request. Compute
+    consumes the prepared tables and never launches assignment implicitly.
+    Allocate one ``plan.create_workspace()`` per concurrent compute; ordered
+    layers may share a workspace. Plan refresh, compute and Graph replay must
+    be ordered on one stream or with explicit CUDA events.
+
+    This explicit call opts into the experimental SM120 backend. No model,
+    TP degree, layer count or configured maximum context length is required.
+    See ``flashinfer/experimental/xqa_decode_buckets/README.md`` for limits.
+    """
+    from .experimental.xqa_decode_buckets import create_plan
+
+    return create_plan(seq_lens, page_table_width=page_table_width, mode=mode)
+
+
+@flashinfer_experimental_api(feature="SM120 NVFP4 Decode buckets")
+def xqa_decode_with_buckets(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_sf_cache: torch.Tensor,
+    v_sf_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    plan,
+    workspace,
+    *,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Run q1 native XQA math using an explicitly refreshed bucket plan.
+
+    Supports SM120 BF16 Q/output ``[B,6,256]``, one local KV head, NHD
+    page32 NVFP4 K/V ``[pages,32,1,128]`` and E4M3 block scales
+    ``[pages,32,1,16]``. Packed data and scale byte strides are retained.
+    ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
+    reached by live lengths must address allocated cache pages. Zero-length
+    rows write zeros. There are no sliding windows, sinks or speculative rows.
+
+    ``bmm1_scale`` directly scales QK before softmax; ``bmm2_scale`` directly
+    scales V/output. They are independent effective scales. The output and
+    workspace are mutable and may not be shared by concurrent calls. Pass
+    ``out`` to avoid allocation during capture. Native XQA remains unchanged;
+    callers select their native fallback for unsupported cases.
+    """
+    from .experimental.xqa_decode_buckets import run
+
+    return run(
+        query,
+        k_cache,
+        v_cache,
+        k_sf_cache,
+        v_sf_cache,
+        page_table,
+        plan,
+        workspace,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        out=out,
+        enable_pdl=enable_pdl,
+    )
 
 
 def get_xqa_module(
