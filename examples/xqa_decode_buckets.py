@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--lengths", default="131072,4096,4096,4096")
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--mode", choices=("persistent", "aligned"), default="persistent"
     )
@@ -25,7 +26,10 @@ def main():
     if not 1 <= len(lengths) <= 32 or min(lengths) < 1 or args.layers < 1:
         parser.error("Use 1-32 positive lengths and at least one layer")
     device = torch.device(args.device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
+    torch.manual_seed(args.seed)
     counts = [(n + 31) // 32 for n in lengths]
     width = max(counts)
     table = torch.zeros((len(lengths), width), dtype=torch.int32, device=device)
@@ -107,6 +111,7 @@ def main():
             lengths=lengths,
             layers=args.layers,
             mode=args.mode,
+            seed=args.seed,
             resources=plan.resources,
             assignment_per_window=1,
         ),
@@ -138,3 +143,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
