@@ -4,11 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
-#include "task_geometry.h"
-
-struct XQABucketTask { int request, begin, end, stride; };
-struct XQABucketRange { int begin, count; };
-struct XQABucketSpan { int begin, end; };
+#include "host_plan.h"
 struct XQATaskContext {
   uint32_t request, slot, begin_tile, end_tile;
   uint32_t partial_begin, partial_count, total_slots;
@@ -24,9 +20,6 @@ struct XQATaskContext {
 #include "mha.cu"
 
 namespace flashinfer::xqa_buckets {
-constexpr int MaxBatch = 32;
-constexpr int Tile = 256;
-constexpr int MaxTableWidth = (0x7fffffff - (Tile - 1)) / 32;
 struct PlanParams {
   const int* lengths;
   XQABucketTask* tasks;

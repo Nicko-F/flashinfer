@@ -30,6 +30,27 @@ def _tensor(tensor, name, *, dtype, shape, device, contiguous=True, alignment=1)
         raise ValueError(f"{name} must have {alignment}-byte aligned storage")
 
 
+def _host_lengths(lengths, batch):
+    if not isinstance(lengths, torch.Tensor) or lengths.dtype != torch.int32:
+        raise TypeError("host_seq_lens must be a CPU int32 tensor")
+    if lengths.device.type != "cpu" or tuple(lengths.shape) != (batch,):
+        raise ValueError(f"host_seq_lens must have CPU shape ({batch},)")
+    if not lengths.is_contiguous():
+        raise ValueError("host_seq_lens must be contiguous")
+
+
+def _descriptor_views(storage, batch, ctas):
+    capacity = ctas + batch - 1
+    tasks_end = 4 * capacity
+    requests_end = tasks_end + 2 * batch
+    return (
+        storage[:tasks_end].view(capacity, 4),
+        storage[tasks_end:requests_end].view(batch, 2),
+        storage[requests_end:-4].view(ctas, 2),
+        storage[-4:],
+    )
+
+
 @register_custom_op(
     "flashinfer::experimental_xqa_bucket_plan",
     mutates_args=("tasks", "requests", "spans", "header"),
@@ -156,6 +177,12 @@ class BucketPlan:
     Compatible layers share the same request ordering and lengths. Replays and
     refreshes must be ordered on the same stream or by explicit CUDA events.
     Separate concurrent computes require independent BucketWorkspace instances.
+
+    Host plans retain caller-owned CPU host_seq_lens; callers keep its values
+    identical to lengths without a device readback. Host prepare runs outside
+    capture before each compute-only Graph replay. One pinned staging backing is
+    reused only after its previous asynchronous H2D finishes. This protects the
+    staging lifetime; stream ordering still protects the device descriptors.
     """
 
     lengths: torch.Tensor
@@ -169,11 +196,39 @@ class BucketPlan:
     scratch_bytes: int
     resources: tuple
     direct: bool
+    planner: str
+    host_seq_lens: torch.Tensor | None
+    _host_descriptors: torch.Tensor | None
+    _device_descriptors: torch.Tensor | None
+    _copy_done: torch.cuda.Event | None
 
     def prepare(self):
         if self.direct:
             return self
         with torch.cuda.device(self.lengths.device):
+            if self.planner == "host":
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "Host prepare must run before Graph replay, outside capture"
+                    )
+                _host_lengths(self.host_seq_lens, self.lengths.numel())
+                # A single bounded staging buffer; never overwrite an in-flight
+                # DMA source. This waits only when the prior copy is unfinished.
+                if not self._copy_done.query():
+                    self._copy_done.synchronize()
+                module, _ = get_module(self.mode == "persistent", self.lengths.device)
+                module.plan_host(
+                    self.host_seq_lens,
+                    self._host_descriptors,
+                    self.ctas,
+                    self.table_width,
+                    self.mode == "aligned",
+                )
+                self._device_descriptors.copy_(
+                    self._host_descriptors, non_blocking=True
+                )
+                self._copy_done.record()
+                return self
             _prepare(
                 self.lengths,
                 self.tasks,
@@ -197,9 +252,13 @@ class BucketPlan:
         )
 
 
-def create_plan(seq_lens, *, page_table_width, mode="persistent"):
+def create_plan(
+    seq_lens, *, page_table_width, mode="persistent", planner="gpu", host_seq_lens=None
+):
     if mode not in ("persistent", "aligned"):
         raise ValueError("mode must be persistent or aligned")
+    if planner not in ("gpu", "host"):
+        raise ValueError("planner must be gpu or host")
     if not isinstance(seq_lens, torch.Tensor) or seq_lens.ndim != 1:
         raise ValueError("seq_lens must be a 1D CUDA int32 tensor")
     device = seq_lens.device
@@ -209,23 +268,52 @@ def create_plan(seq_lens, *, page_table_width, mode="persistent"):
     if get_compute_capability(device) != (12, 0):
         raise ValueError("XQA Decode buckets currently support SM120")
     batch = seq_lens.numel()
+    if planner == "host":
+        _host_lengths(host_seq_lens, batch)
+    elif host_seq_lens is not None:
+        raise ValueError("host_seq_lens is only used with planner='host'")
     ctas, direct = plan_geometry(batch, page_table_width, get_device_sm_count(device))
     capacity = plan_capacity(batch, ctas, page_table_width)
     module, resources = get_module(
         mode == "persistent" and not direct, device, direct=direct
     )
+    host_descriptors = device_descriptors = copy_done = None
+    if planner == "host" and not direct:
+        words = 6 * (ctas + batch)
+        host_descriptors = torch.empty(words, dtype=torch.int32, pin_memory=True)
+        device_descriptors = torch.empty(words, dtype=torch.int32, device=device)
+        tasks, requests, spans, header = _descriptor_views(
+            device_descriptors, batch, ctas
+        )
+        copy_done = torch.cuda.Event()
+    else:
+        tasks = torch.empty(
+            (0 if direct else capacity, 4), dtype=torch.int32, device=device
+        )
+        requests = torch.empty(
+            (0 if direct else batch, 2), dtype=torch.int32, device=device
+        )
+        spans = torch.empty(
+            (0 if direct else ctas, 2), dtype=torch.int32, device=device
+        )
+        header = torch.empty(0 if direct else 4, dtype=torch.int32, device=device)
     plan = BucketPlan(
         seq_lens,
-        torch.empty((0 if direct else capacity, 4), dtype=torch.int32, device=device),
-        torch.empty((0 if direct else batch, 2), dtype=torch.int32, device=device),
-        torch.empty((0 if direct else ctas, 2), dtype=torch.int32, device=device),
-        torch.empty(0 if direct else 4, dtype=torch.int32, device=device),
+        tasks,
+        requests,
+        spans,
+        header,
         ctas,
         page_table_width,
         mode,
         module.scratch_bytes(capacity),
         resources,
         direct,
+        planner,
+        host_seq_lens,
+        host_descriptors,
+        device_descriptors,
+        copy_done,
     )
     # The initial generation is usable immediately. Later forwards refresh it explicitly.
     return plan.prepare()

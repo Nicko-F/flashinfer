@@ -57,6 +57,26 @@ void bucket_plan(TensorView lengths, TensorView tasks, TensorView requests, Tens
 #endif
 }
 
+void bucket_plan_host(TensorView lengths, TensorView descriptors, int64_t ctas,
+                      int64_t table_width, bool aligned) {
+  CHECK_CPU(lengths);
+  CHECK_CPU(descriptors);
+  CHECK_CONTIGUOUS(lengths);
+  CHECK_CONTIGUOUS(descriptors);
+  CHECK_DIM(1, lengths);
+  CHECK_DIM(1, descriptors);
+  CHECK_INPUT_TYPE(lengths, dl_int32);
+  CHECK_INPUT_TYPE(descriptors, dl_int32);
+  int64_t batch = lengths.numel();
+  TVM_FFI_ICHECK(batch >= 1 && batch <= buckets::MaxBatch && ctas >= batch &&
+                 ctas <= INT32_MAX - buckets::MaxBatch);
+  TVM_FFI_ICHECK(table_width >= 1 && table_width <= buckets::MaxTableWidth);
+  TVM_FFI_ICHECK_EQ(descriptors.numel(), buckets::descriptor_words(int(batch), int(ctas)));
+  buckets::plan_host(static_cast<const int*>(lengths.data_ptr()),
+                     static_cast<int*>(descriptors.data_ptr()), int(batch), int(ctas),
+                     int(table_width), aligned);
+}
+
 int64_t bucket_scratch_bytes(int64_t capacity) {
   TVM_FFI_ICHECK(capacity >= 1 && capacity <= INT32_MAX);
   uint64_t size = buckets::scratch_bytes(int(capacity));
@@ -148,6 +168,7 @@ void bucket_compute(TensorView q, TensorView k, TensorView v, TensorView ks, Ten
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, bucket_plan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_host, bucket_plan_host);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, bucket_compute);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(scratch_bytes, bucket_scratch_bytes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure, bucket_configure);

@@ -85,6 +85,92 @@ def _require_sm120():
         raise unittest.SkipTest("Requires SM120")
 
 
+def _check_host_planner(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        raise unittest.SkipTest("A C++17 compiler is needed for the host planner test")
+    header = (
+        Path(__file__).resolve().parents[2]
+        / "flashinfer/experimental/xqa_decode_buckets/csrc/host_plan.h"
+    )
+    source = tmp_path / "host_plan.cpp"
+    source.write_text(f'''#include "{header.as_posix()}"
+#include <cassert>
+#include <vector>
+int main() {{
+  using namespace flashinfer::xqa_buckets;
+  int lengths[] = {{0, 768, 512}};
+  std::vector<int> storage(descriptor_words(3, 4));
+  plan_host(lengths, storage.data(), 3, 4, 24, false);
+  std::vector<int> expected = {{1,0,2,1, 1,2,3,1, 2,0,1,1, 2,1,2,1,
+      0,0,0,0, 0,0,0,0, 0,0, 0,2, 2,2, 0,1, 1,3, 3,4, 0,0, 2,4,3,2}};
+  assert(storage == expected);
+  plan_host(lengths, storage.data(), 3, 4, 24, true);
+  expected = {{1,0,1,1, 1,1,3,1, 2,0,2,1, 0,0,0,0,
+      0,0,0,0, 0,0,0,0, 0,0, 0,2, 2,1, 0,1, 1,2, 2,3, 0,0, 2,3,3,2}};
+  assert(storage == expected);
+  for (bool aligned : {{false, true}}) {{
+    for (int batch : {{1, 3, 8, 32}}) {{
+      for (int ctas : {{32, 170, 340}}) {{
+        for (int generation = 0; generation < 5; ++generation) {{
+          std::vector<int> lens(batch);
+          for (int r = 0; r < batch; ++r)
+            lens[r] = generation == 0 ? 0 :
+                (generation == 1 ? 4096 : (generation == 2 ? (r ? 4096 : 131072) :
+                  (generation == 3 ? (r * 257) % 8193 : 2147483360)));
+          int capacity = ctas + batch - 1;
+          std::vector<int> data(descriptor_words(batch, ctas) + 2, -71);
+          plan_host(lens.data(), data.data() + 1, batch, ctas, MaxTableWidth, aligned);
+          assert(data.front() == -71 && data.back() == -71);
+          auto* tasks = reinterpret_cast<XQABucketTask*>(data.data() + 1);
+          auto* requests = reinterpret_cast<XQABucketRange*>(data.data() + 1 + 4 * capacity);
+          auto* spans = reinterpret_cast<XQABucketSpan*>(data.data() + 1 + 4 * capacity + 2 * batch);
+          auto* h = data.data() + data.size() - 5;
+          assert(h[1] <= capacity && h[2] <= ctas);
+          int next = 0;
+          for (int r = 0; r < batch; ++r) {{
+            assert(requests[r].begin == next);
+            int tile = 0;
+            for (int i = 0; i < requests[r].count; ++i) {{
+              auto t = tasks[next++];
+              assert(t.request == r && t.begin == tile && t.end > tile && t.stride == 1);
+              tile = t.end;
+            }}
+            assert(tile == direct_tile_count(lens[r]));
+          }}
+          assert(next == h[1]);
+          next = 0;
+          for (int c = 0; c < ctas; ++c) {{
+            auto s = spans[c];
+            if (s.end == 0) {{ assert(s.begin == 0); continue; }}
+            assert(s.begin == next && s.end > next && s.end <= h[1]);
+            next = s.end;
+          }}
+          assert(next == h[1]);
+        }}
+      }}
+    }}
+  }}
+  for (int invalid : {{-1, 769}}) {{
+    lengths[1] = invalid;
+    bool rejected = false;
+    try {{ plan_host(lengths, storage.data(), 3, 4, 24, false); }}
+    catch (const std::invalid_argument&) {{ rejected = true; }}
+    assert(rejected);
+  }}
+}}
+''')
+    binary = tmp_path / "host_plan.exe"
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run([str(binary)], check=True, capture_output=True, timeout=10)
+
+
 def _case(lengths, *, interleaved=False, capacity_length=None):
     device = torch.device("cuda", torch.cuda.current_device())
     # Reserve the same per-request capacity for changed row lengths/page mappings.
@@ -223,7 +309,13 @@ def _assert_plan(plan, lengths):
 
 
 def _check_changed_graph(
-    mode, interleaved, *, direct=False, capacity_length=None, direct_batch=1
+    mode,
+    interleaved,
+    *,
+    direct=False,
+    capacity_length=None,
+    direct_batch=1,
+    planner="gpu",
 ):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
@@ -261,7 +353,13 @@ def _check_changed_graph(
         initial, interleaved=interleaved, capacity_length=capacity_length
     )
     plan = create_xqa_decode_bucket_plan(
-        lens, page_table_width=table.shape[1], mode=mode
+        lens,
+        page_table_width=table.shape[1],
+        mode=mode,
+        planner=planner,
+        host_seq_lens=torch.tensor(initial, dtype=torch.int32)
+        if planner == "host"
+        else None,
     )
     assert plan.direct == direct
     if direct and capacity_length == 512:
@@ -311,7 +409,8 @@ def _check_changed_graph(
         else nullcontext()
     )
     with no_assignment, torch.cuda.graph(graph):
-        plan.prepare()
+        if planner == "gpu":
+            plan.prepare()
         compute_layers()
     pointers = [
         value.data_ptr()
@@ -319,6 +418,9 @@ def _check_changed_graph(
     ]
     for lengths in replay_lengths:
         lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=lens.device))
+        if planner == "host":
+            plan.host_seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+            plan.prepare()
         table.copy_(table.roll(1, dims=1))
         if direct and len(initial) > 1:
             table.copy_(table.roll(1, dims=0))
@@ -423,8 +525,28 @@ class GeometryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             _check_aligned_boundaries(Path(directory))
 
+    def test_compiled_host_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _check_host_planner(Path(directory))
+
 
 class BucketGraphTests(unittest.TestCase):
+    def test_host_replay(self):
+        _require_sm120()
+        for mode in ("persistent", "aligned"):
+            for interleaved in (False, True):
+                with self.subTest(mode=mode, interleaved=interleaved):
+                    _check_changed_graph(mode, interleaved, planner="host")
+            for batch, capacity in ((1, 131072), (4, 512)):
+                _check_changed_graph(
+                    mode,
+                    False,
+                    direct=True,
+                    capacity_length=capacity,
+                    direct_batch=batch,
+                    planner="host",
+                )
+
     def test_direct_replay(self):
         _require_sm120()
         for mode in ("persistent", "aligned"):
@@ -468,6 +590,114 @@ class BucketModuleTests(unittest.TestCase):
             for lengths in ([512], [8064] * 32, [131072] + [4096] * 31):
                 with self.subTest(mode=mode, lengths=lengths):
                     _check_module_case(lengths, mode)
+
+
+class HostPlannerTests(unittest.TestCase):
+    def test_descriptor_abi_and_validation(self):
+        _require_sm120()
+        from flashinfer.xqa import create_xqa_decode_bucket_plan
+        from flashinfer.experimental.xqa_decode_buckets.jit import get_module
+
+        host_lengths = torch.zeros(32, dtype=torch.int32)
+        lens = host_lengths.cuda()
+        for mode in ("persistent", "aligned"):
+            host = create_xqa_decode_bucket_plan(
+                lens,
+                page_table_width=4096,
+                mode=mode,
+                planner="host",
+                host_seq_lens=host_lengths,
+            )
+            gpu = create_xqa_decode_bucket_plan(lens, page_table_width=4096, mode=mode)
+            assert host._host_descriptors.is_pinned()
+            assert host._device_descriptors.numel() == 6 * (host.ctas + 32)
+            assert (
+                len(
+                    {
+                        t.untyped_storage().data_ptr()
+                        for t in (
+                            host.tasks,
+                            host.requests,
+                            host.spans,
+                            host.header,
+                        )
+                    }
+                )
+                == 1
+            )
+            pointers = [
+                t.data_ptr()
+                for t in (host.tasks, host.requests, host.spans, host.header)
+            ]
+            for lengths in (
+                [4096] * 32,
+                [131072] + [4096] * 31,
+                [0, 1, 255, 256, 257, 512, 8193, 0] * 4,
+                [0] * 32,
+                [4096] * 32,
+            ):
+                host_lengths.copy_(torch.tensor(lengths, dtype=torch.int32))
+                lens.copy_(host_lengths)
+                # Back-to-back refreshes exercise bounded staging reuse before
+                # the first copy is necessarily complete.
+                host.prepare()
+                host.prepare()
+                gpu.prepare()
+                torch.cuda.synchronize()
+                _assert_plan(host, lengths)
+                slots = host.header[1].item()
+                for a, b in (
+                    (host.header, gpu.header),
+                    (host.requests, gpu.requests),
+                    (host.spans, gpu.spans),
+                    (host.tasks[:slots], gpu.tasks[:slots]),
+                ):
+                    assert torch.equal(a, b)
+                assert pointers == [
+                    t.data_ptr()
+                    for t in (
+                        host.tasks,
+                        host.requests,
+                        host.spans,
+                        host.header,
+                    )
+                ]
+            module, _ = get_module(mode == "persistent", lens.device)
+            for invalid in (-1, 131073):
+                host_lengths[0] = invalid
+                with self.assertRaises((ValueError, RuntimeError)):
+                    module.plan_host(
+                        host_lengths,
+                        host._host_descriptors,
+                        host.ctas,
+                        4096,
+                        mode == "aligned",
+                    )
+            host_lengths.zero_()
+            graph = torch.cuda.CUDAGraph()
+            with (
+                self.assertRaisesRegex(RuntimeError, "outside capture"),
+                torch.cuda.graph(graph),
+            ):
+                host.prepare()
+        for metadata in (
+            None,
+            torch.zeros(32),
+            torch.zeros(64, dtype=torch.int32)[::2],
+            lens,
+            torch.zeros(31, dtype=torch.int32),
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                create_xqa_decode_bucket_plan(
+                    lens,
+                    page_table_width=4096,
+                    planner="host",
+                    host_seq_lens=metadata,
+                )
+        with self.assertRaises(ValueError):
+            create_xqa_decode_bucket_plan(
+                lens, page_table_width=4096, planner="invalid"
+            )
 
 
 if __name__ == "__main__":

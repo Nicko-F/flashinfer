@@ -39,7 +39,12 @@ from .utils import (
 
 @flashinfer_experimental_api(feature="SM120 NVFP4 Decode bucket planning")
 def create_xqa_decode_bucket_plan(
-    seq_lens: torch.Tensor, *, page_table_width: int, mode: str = "persistent"
+    seq_lens: torch.Tensor,
+    *,
+    page_table_width: int,
+    mode: str = "persistent",
+    planner: str = "gpu",
+    host_seq_lens: Optional[torch.Tensor] = None,
 ):
     """Allocate and prepare an experimental reusable q1 Decode work plan.
 
@@ -63,13 +68,29 @@ def create_xqa_decode_bucket_plan(
     layers may share a workspace. Plan refresh, compute and Graph replay must
     be ordered on one stream or with explicit CUDA events.
 
+    ``planner="gpu"`` (default) plans from device lengths and can be captured.
+    ``planner="host"`` requires caller-owned contiguous CPU int32
+    ``host_seq_lens[B]`` with the same values and request order as ``seq_lens``.
+    It fills pinned descriptors in compiled C++ and submits one asynchronous
+    H2D copy; there is no device-to-host length read. Update both length buffers,
+    then call host ``prepare()`` outside capture before each compute-only Graph
+    replay. CPU planning does not execute during replay. A bounded staging buffer
+    waits for its previous copy only if still in flight. Both planners preserve
+    the direct-plan no-op and use identical compute and task ownership.
+
     This explicit call opts into the experimental SM120 backend. No model,
     TP degree, layer count or configured maximum context length is required.
     See ``flashinfer/experimental/xqa_decode_buckets/README.md`` for limits.
     """
     from .experimental.xqa_decode_buckets import create_plan
 
-    return create_plan(seq_lens, page_table_width=page_table_width, mode=mode)
+    return create_plan(
+        seq_lens,
+        page_table_width=page_table_width,
+        mode=mode,
+        planner=planner,
+        host_seq_lens=host_seq_lens,
+    )
 
 
 @flashinfer_experimental_api(feature="SM120 NVFP4 Decode buckets")

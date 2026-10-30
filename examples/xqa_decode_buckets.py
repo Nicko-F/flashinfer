@@ -2,13 +2,212 @@
 """Runnable module example; benchmarks include assignment for prepared plans."""
 
 import argparse
+import json
+from pathlib import Path
 import statistics
+import time
 
 import torch
 
 from flashinfer.decode import xqa_batch_decode_with_kv_cache
 from flashinfer.testing import bench_gpu_time
 from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
+
+
+def compare_planners(args):
+    """Static metadata, shared operands; host planning stays outside Graphs."""
+    from flashinfer.experimental.xqa_decode_buckets.jit import get_module
+
+    records = []
+    scenarios = (
+        ("balanced_b32_adapted_from_tencent_b64", [4096] * 32),
+        ("skew_b8", [65536] + [4096] * 7),
+        ("skew_b32", [131072] + [4096] * 31),
+        ("short_direct_control", [512]),
+    )
+    stream = torch.cuda.current_stream()
+
+    def wall_samples(call):
+        for _ in range(5):
+            call()
+            stream.synchronize()
+        samples = []
+        for _ in range(20):
+            start = time.perf_counter_ns()
+            call()
+            stream.synchronize()
+            samples.append((time.perf_counter_ns() - start) / 1000)
+        return samples
+
+    def graph_samples(call):
+        return [
+            value * 1000
+            for value in bench_gpu_time(
+                call,
+                enable_cupti=False,
+                use_cuda_graph=True,
+                cold_l2_cache=False,
+                dry_run_iters=5,
+                repeat_iters=20,
+            )
+        ]
+
+    for label, lengths in scenarios:
+        torch.manual_seed(args.seed)
+        batch, width = len(lengths), (max(lengths) + 31) // 32
+        cpu_lengths = torch.tensor(lengths, dtype=torch.int32)
+        lens = cpu_lengths.to(args.device)
+        table = torch.zeros((batch, width), dtype=torch.int32, device=args.device)
+        pages = 0
+        for row, length in enumerate(lengths):
+            count = (length + 31) // 32
+            table[row, :count] = torch.arange(pages, pages + count, device=args.device)
+            pages += count
+        plans = {
+            planner: create_xqa_decode_bucket_plan(
+                lens,
+                page_table_width=width,
+                mode=args.mode,
+                planner=planner,
+                host_seq_lens=cpu_lengths if planner == "host" else None,
+            )
+            for planner in ("gpu", "host")
+        }
+        bank = []
+        for _ in range(args.layers):
+            q = (
+                torch.randn((batch, 6, 256), dtype=torch.bfloat16, device=args.device)
+                * 0.25
+            )
+            kv = [
+                torch.randint(
+                    0, 256, (pages, 32, 1, 128), dtype=torch.uint8, device=args.device
+                )
+                for _ in range(2)
+            ]
+            sf = [
+                torch.ones(
+                    (pages, 32, 1, 16), dtype=torch.float8_e4m3fn, device=args.device
+                )
+                for _ in range(2)
+            ]
+            outputs = {p: torch.empty_like(q) for p in plans}
+            workspaces = {p: plans[p].create_workspace() for p in plans}
+            bank.append((q, kv, sf, outputs, workspaces))
+
+        def compute(planner):
+            for q, kv, sf, outputs, workspaces in bank:
+                xqa_decode_with_buckets(
+                    q,
+                    *kv,
+                    *sf,
+                    table,
+                    plans[planner],
+                    workspaces[planner],
+                    bmm1_scale=0.7 / 16,
+                    bmm2_scale=1.3,
+                    out=outputs[planner],
+                )
+
+        compute_graphs = {}
+        for planner in plans:
+            compute(planner)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                compute(planner)
+            compute_graphs[planner] = graph
+        full_gpu = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(full_gpu):
+            plans["gpu"].prepare()
+            compute("gpu")
+
+        def external(planner):
+            plans[planner].prepare()
+            compute_graphs[planner].replay()
+
+        samples = {}
+        # Bracket the host arm with the GPU arm on the same data and placement.
+        for name, call in (
+            ("gpu_captured_completed_wall_before_us", full_gpu.replay),
+            ("host_prepare_h2d_graph_completed_wall_us", lambda: external("host")),
+            ("gpu_captured_completed_wall_after_us", full_gpu.replay),
+            ("gpu_external_prepare_graph_completed_wall_us", lambda: external("gpu")),
+        ):
+            samples[name] = wall_samples(call)
+        for planner in compute_graphs:
+            samples[planner + "_compute_only_graph_gpu_us"] = graph_samples(
+                lambda planner=planner: compute(planner)
+            )
+
+        def gpu_window():
+            plans["gpu"].prepare()
+            compute("gpu")
+
+        samples["gpu_assign_compute_graph_gpu_us"] = graph_samples(gpu_window)
+        host = plans["host"]
+        if not host.direct:
+            module, _ = get_module(args.mode == "persistent", lens.device)
+            staging = torch.empty_like(host._host_descriptors, pin_memory=True)
+            fill = lambda: module.plan_host(
+                cpu_lengths, staging, host.ctas, width, args.mode == "aligned"
+            )
+            for _ in range(5):
+                fill()
+            fill_samples = []
+            for _ in range(20):
+                start = time.perf_counter_ns()
+                for _ in range(20):
+                    fill()
+                fill_samples.append((time.perf_counter_ns() - start) / 20000)
+            samples["host_cpp_ffi_fill_cpu_us"] = fill_samples
+            samples["descriptor_h2d_completed_wall_us"] = wall_samples(
+                lambda: host._device_descriptors.copy_(staging, non_blocking=True)
+            )
+        external("host")
+        full_gpu.replay()
+        stream.synchronize()
+        errors = []
+        for _, _, _, outputs, workspaces in bank:
+            error = (outputs["host"].float() - outputs["gpu"].float()).norm() / outputs[
+                "gpu"
+            ].float().norm().clamp_min(1e-8)
+            errors.append(error.item())
+            if not torch.isfinite(outputs["host"]).all() or errors[-1] >= 0.03:
+                raise RuntimeError("Host/GPU output check failed")
+            if any(workspace.semaphores.any() for workspace in workspaces.values()):
+                raise RuntimeError("Counter reset check failed")
+        record = dict(
+            scenario=label,
+            lengths=lengths,
+            layers=args.layers,
+            mode=args.mode,
+            seed=args.seed,
+            direct=host.direct,
+            ctas=host.ctas,
+            resources=host.resources,
+            descriptor_bytes=0 if host.direct else host._host_descriptors.numel() * 4,
+            cpu_metadata="caller-provided exact CPU lengths; unchanged during timing",
+            length_upload="excluded equally: static metadata already resident for both arms",
+            graph_scope="compute-only except gpu_assign_compute graph; host prepare is external",
+            samples=samples,
+            medians={key: statistics.median(v) for key, v in samples.items()},
+            host_vs_gpu_relative_rms=errors,
+        )
+        records.append(record)
+        print(json.dumps(record), flush=True)
+        if args.output_json:
+            target = Path(args.output_json)
+            temporary = target.with_suffix(target.suffix + ".partial")
+            temporary.write_text(
+                json.dumps(dict(complete=False, records=records), indent=2)
+            )
+            temporary.replace(target)
+    if args.output_json:
+        target = Path(args.output_json)
+        temporary = target.with_suffix(target.suffix + ".partial")
+        temporary.write_text(json.dumps(dict(complete=True, records=records), indent=2))
+        temporary.replace(target)
 
 
 def main():
@@ -24,12 +223,24 @@ def main():
         "--mode", choices=("persistent", "aligned"), default="persistent"
     )
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--compare-planners", action="store_true")
+    parser.add_argument("--output-json")
     parser.add_argument(
         "--diagnose",
         action="store_true",
         help="Time planner and compute windows separately",
     )
     args = parser.parse_args()
+    if args.compare_planners:
+        if args.layers < 1:
+            parser.error("Use at least one layer")
+        device = torch.device(args.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        args.device = device
+        torch.cuda.set_device(device)
+        compare_planners(args)
+        return
     lengths = [int(n) for n in args.lengths.split(",")]
     if not 1 <= len(lengths) <= 32 or min(lengths) < 1 or args.layers < 1:
         parser.error("Use 1-32 positive lengths and at least one layer")

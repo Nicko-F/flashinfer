@@ -2,7 +2,7 @@
 
 This backend uses the native XQA loader, BF16 QK/PV arithmetic, FP32 softmax and
 accumulation, and normalized-partial last-CTA merge. A separately prepared GPU
-work plan balances KV tiles across requests. For B=1, or when every potential KV
+or caller-metadata host work plan balances KV tiles across requests. For B=1, or when every potential KV
 tile fits the device CTA budget, the compute kernel derives its task interval
 directly from live device lengths, without a separate assignment launch. Native
 XQA behavior is unchanged.
@@ -94,6 +94,60 @@ Allocate/JIT before capture and supply `out`; capture `plan.prepare()` once plus
 all compatible computes, or prepare on the current stream before replaying a
 compute-only Graph. The latter includes an external planning launch and must be
 timed as such.
+
+### Explicit host planner
+
+The default `planner="gpu"` retains device Assign and its capture support.
+`planner="host"` instead requires a caller-owned contiguous CPU int32
+`host_seq_lens[B]`, with exactly the same lengths and request ordering as the
+device `seq_lens`. The library does not copy device lengths back or infer them
+from the page table. Values are checked against table capacity by the compiled
+CPU planner; matching CPU/device metadata is the caller's responsibility.
+
+```python
+plan = create_xqa_decode_bucket_plan(
+    seq_lens, page_table_width=page_table.shape[1],
+    planner="host", host_seq_lens=host_seq_lens,
+)
+# Capture only the compatible compute calls, with plan/workspace kept alive.
+# After updating both length buffers for the next forward:
+plan.prepare()  # CPU fill + one H2D, outside capture
+compute_graph.replay()
+```
+
+The C++ fill uses the same descriptor ABI, integer ownership math and compute
+kernel as GPU Assign. One contiguous device descriptor backing has fixed views
+for tasks, request ranges, CTA spans and header. One equally sized pinned CPU
+backing is filled without Python per-descriptor loops, then copied by a single
+asynchronous H2D. Storage is `24 * (CTAs + B)` bytes: 4,848 bytes for B32/170 CTAs.
+Before refilling the staging backing, an event waits only if its previous H2D
+is still in flight. This bounds staging storage and prevents DMA-source reuse;
+the existing same-stream/event ordering requirement still protects device
+descriptors from their prior compute consumers. Simultaneous host calls on the
+same plan are unsupported. Direct plans retain empty descriptors and no-op
+preparation for either planner.
+
+Host preparation must run before each replay, outside capture; attempting to
+capture a prepared host plan raises an error. CPU execution does not recur in a
+CUDA Graph. Compute-only Graph time therefore excludes host fill, H2D submission
+and dependency costs and must be labeled separately from completed wall time.
+
+The bounded comparison example uses the same operand bank and compute path for
+both planners and reports CPU C++/FFI fill, descriptor-copy completed wall,
+compute-only GPU Graph and full completed-wall windows. GPU planning is measured
+both inside its captured graph and before a compute-only graph. Metadata is
+static during timing, so length uploads are excluded equally. Changed lengths,
+row order, page IDs, zero/restore and staging reuse are covered by focused tests.
+
+```bash
+python examples/xqa_decode_buckets.py --compare-planners --layers 2 --output-json timings.json
+```
+
+Its balanced `32 x 4096` pattern adapts Tencent's B64 length pattern to this
+backend's explicit B32 support; other anchors are `65536 + 7 x 4096`,
+`131072 + 31 x 4096`, and a direct `512` control. Only the length patterns are
+reused; dtype, backend and compute arithmetic remain this port's NVFP4 XQA.
+This is a module comparison, not a vLLM integration or model/service claim.
 
 The persistent specialization retains the audited 256-thread producer/consumer
 participants, named PV-tail barriers, async-copy drains, and full-CTA task join.
@@ -249,3 +303,45 @@ multi-request tables, vLLM metadata/capture integration and model/service timing
 still require validation. In particular the wide-table B1 result is sensitive to
 the actual capacity exposed by the framework and cannot be assumed for every
 serving configuration. No transposed Compute implementation is claimed.
+
+## Host versus GPU planning (2026-10-30)
+
+All eleven focused test groups passed in 29.664 seconds, including both planner
+choices and modes, changed-input host replay, descriptor equality over meaningful
+slots, CPU validation, capture rejection and repeated staging reuse. Native
+compute resource reports remained unchanged: persistent 201 registers, aligned
+and direct 186; all use 70,272 shared bytes, 112 stack bytes and zero compiler
+spill loads/stores.
+
+One bounded persistent-mode invocation compared four patterns on RTX 5090
+physical GPU0 with NUMA0 CPU affinity, seed0 and two layers. The same inputs were
+reused with static exact CPU/device lengths. Length uploads are excluded equally;
+these are hot-cache module windows. GPU Graph timing uses FlashInfer's existing
+benchmark helper, five warmups, twenty samples, CUPTI off and cold-L2 handling
+off. Completed wall samples include stream completion. The GPU captured wall is
+the mean of medians measured before and after the host arm. GPU external wall
+prepares on the CPU call path before its compute-only Graph, matching that
+integration boundary of the host arm. Units below are microseconds.
+
+| Lengths | GPU captured complete wall | GPU external complete wall | Host fill + H2D + Graph complete wall | CPU C++/FFI fill | H2D complete wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32 x 4096 | 76.040 | 82.297 | 93.134 | 2.660 | 8.782 |
+| 65536 + 7 x 4096 | 83.835 | 90.809 | 102.408 | 1.678 | 8.113 |
+| 131072 + 31 x 4096 | 150.187 | 156.988 | 166.353 | 2.553 | 8.056 |
+| 512, direct | 30.341 | 30.446 | 30.648 | no-op | no copy |
+
+Compute-only GPU Graph medians were 63.248/74.922/137.027 us for GPU-planned
+descriptors and 63.248/74.717/136.874 us for host-planned descriptors at the three
+prepared patterns. Those windows omit host planning and H2D and do not establish
+a host-planner gain. GPU Assign plus compute Graph medians were
+69.648/77.584/144.093 us. Both direct compute-only medians were 23.722 us.
+Component timings were measured independently and are not assumed additive.
+
+The host option is slower for all three prepared patterns in completed wall
+time, including against external GPU preparation. GPU remains the default;
+host planning is retained as an explicit caller-metadata alternative. No tuning,
+native compute change, vLLM integration or model/service speedup is claimed.
+An initial timing harness attempt failed by capturing an existing Graph replay;
+it produced no result row and was preserved. The corrected invocation captures
+the original compute closures with the benchmark helper. The clean timing run
+was not repeated.
