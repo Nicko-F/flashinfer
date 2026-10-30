@@ -170,6 +170,15 @@ int main() {{
     catch (const std::invalid_argument&) {{ rejected = true; }}
     assert(rejected);
   }}
+  lengths[0] = 0; lengths[1] = 5; lengths[2] = 6;
+  plan_host(lengths, storage.data(), 3, 4, 24, false, 32, 5);
+  for (int invalid : {{1, 2, 3, 4}}) {{
+    lengths[1] = invalid;
+    bool rejected = false;
+    try {{ plan_host(lengths, storage.data(), 3, 4, 24, false, 32, 5); }}
+    catch (const std::invalid_argument&) {{ rejected = true; }}
+    assert(rejected);
+  }}
 }}
 ''')
     binary = tmp_path / "host_plan.exe"
@@ -191,6 +200,7 @@ def _case(
     page_size=32,
     num_kv_heads=1,
     head_group_ratio=6,
+    q_len_per_req=1,
 ):
     device = torch.device("cuda", torch.cuda.current_device())
     # Reserve the same per-request capacity for changed row lengths/page mappings.
@@ -251,7 +261,9 @@ def _case(
     lens = torch.tensor(lengths, dtype=torch.int32, device=device)
     queries = [
         torch.randn(
-            (batch, num_kv_heads * head_group_ratio, 256),
+            (batch, num_kv_heads * head_group_ratio, 256)
+            if q_len_per_req == 1
+            else (batch, q_len_per_req, num_kv_heads * head_group_ratio, 256),
             device=device,
             dtype=torch.bfloat16,
         )
@@ -270,10 +282,14 @@ def _reference(query, data, scales, table, lengths, bmm1, bmm2):
     output = torch.zeros_like(query)
     page_size = data[0].shape[1]
     heads = data[0].shape[2]
-    ratio = query.shape[1] // heads
+    query_rows = query.unsqueeze(1) if query.ndim == 3 else query
+    output_rows = output.unsqueeze(1) if output.ndim == 3 else output
+    tokens = query_rows.shape[1]
+    ratio = query_rows.shape[2] // heads
     for row, length in enumerate(lengths):
         if not length:
             continue
+        assert length >= tokens
         ids = table[row, : (length + page_size - 1) // page_size].long()
         operands = []
         for packed, sf in zip(data, scales, strict=True):
@@ -285,12 +301,17 @@ def _reference(query, data, scales, table, lengths, bmm1, bmm2):
                 .repeat_interleave(16, -1)
             )
             operands.append((lut[codes] * block_scales).to(torch.bfloat16).float())
-        for head in range(heads):
-            qh = slice(head * ratio, (head + 1) * ratio)
-            scores = (query[row, qh].float() @ operands[0][:, head].T) * bmm1
-            output[row, qh] = (scores.softmax(-1) @ operands[1][:, head] * bmm2).to(
-                output.dtype
-            )
+        # Independent prefix reference: no task boundaries or packed-mask math.
+        for token in range(tokens):
+            visible = length - tokens + token + 1
+            for head in range(heads):
+                qh = slice(head * ratio, (head + 1) * ratio)
+                scores = (
+                    query_rows[row, token, qh].float() @ operands[0][:visible, head].T
+                ) * bmm1
+                output_rows[row, token, qh] = (
+                    scores.softmax(-1) @ operands[1][:visible, head] * bmm2
+                ).to(output.dtype)
     return output
 
 
@@ -372,6 +393,7 @@ def _check_changed_graph(
     page_size=32,
     num_kv_heads=1,
     head_group_ratio=6,
+    q_len_per_req=1,
 ):
     _require_sm120()
     from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
@@ -433,6 +455,11 @@ def _check_changed_graph(
             assert direct_batch == 32
             initial = [0, 1, 255, 256] * 8
             replay_lengths = (initial, [256, 0, 1, 255] * 8, [0] * 32, initial)
+    if q_len_per_req > 1:
+        initial = [max(n, q_len_per_req) if n else 0 for n in initial]
+        replay_lengths = [
+            [max(n, q_len_per_req) if n else 0 for n in row] for row in replay_lengths
+        ]
     queries, data, scales, table, lens = _case(
         initial,
         interleaved=interleaved,
@@ -440,6 +467,7 @@ def _check_changed_graph(
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         head_group_ratio=head_group_ratio,
+        q_len_per_req=q_len_per_req,
     )
     plan = create_xqa_decode_bucket_plan(
         lens,
@@ -448,6 +476,7 @@ def _check_changed_graph(
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         head_group_ratio=head_group_ratio,
+        q_len_per_req=q_len_per_req,
         planner=planner,
         host_seq_lens=torch.tensor(initial, dtype=torch.int32)
         if planner == "host"
@@ -459,6 +488,10 @@ def _check_changed_graph(
     assert plan.page_size == page_size
     assert plan.num_kv_heads == num_kv_heads
     assert plan.head_group_ratio == head_group_ratio
+    assert plan.q_len_per_req == q_len_per_req
+    assert plan.num_groups == num_kv_heads * (
+        (q_len_per_req * head_group_ratio + 15) // 16
+    )
     print(
         dict(
             mode=mode,
@@ -466,6 +499,7 @@ def _check_changed_graph(
             page_size=page_size,
             num_kv_heads=num_kv_heads,
             head_group_ratio=head_group_ratio,
+            q_len_per_req=q_len_per_req,
             resources=plan.resources,
             ctas=plan.ctas,
         ),
@@ -473,13 +507,13 @@ def _check_changed_graph(
     )
     workspaces = [plan.create_workspace() for _ in queries]
     guards = []
-    if num_kv_heads > 1:
+    if plan.num_groups > 1:
         for index in range(len(workspaces)):
             scratch_guard = torch.full(
                 (plan.scratch_bytes + 32,), 167, dtype=torch.uint8, device=lens.device
             )
             counter_guard = torch.full(
-                (len(initial) * num_kv_heads + 8,),
+                (len(initial) * plan.num_groups + 8,),
                 -73,
                 dtype=torch.int32,
                 device=lens.device,
@@ -489,7 +523,9 @@ def _check_changed_graph(
                 scratch_guard[16:-16], counter_guard[4:-4]
             )
             guards.append((scratch_guard, counter_guard))
-    assert all(w.semaphores.numel() == len(initial) * num_kv_heads for w in workspaces)
+    assert all(
+        w.semaphores.numel() == len(initial) * plan.num_groups for w in workspaces
+    )
     if not direct:
         assert plan.tasks.shape[0] == plan.ctas + len(initial) - 1
     assert len({workspace.scratch.data_ptr() for workspace in workspaces}) == len(
@@ -500,7 +536,14 @@ def _check_changed_graph(
     )
     backings = [
         torch.full(
-            (len(initial) + 1, num_kv_heads * head_group_ratio, 256),
+            (len(initial) + 1, num_kv_heads * head_group_ratio, 256)
+            if q_len_per_req == 1
+            else (
+                len(initial) + 1,
+                q_len_per_req,
+                num_kv_heads * head_group_ratio,
+                256,
+            ),
             19,
             dtype=torch.bfloat16,
             device=lens.device,
@@ -555,7 +598,14 @@ def _check_changed_graph(
             table.copy_(table.roll(1, dims=0))
         for query in queries:
             query.normal_(0, 0.25)
-        inputs = [*queries, *data, *scales, table, lens]
+        inputs = [
+            *queries,
+            *data,
+            *scales,
+            table,
+            lens,
+            plan.causal_mask.view(torch.int16),
+        ]
         snapshots = [value.clone() for value in inputs]
         graph.replay()
         torch.cuda.synchronize()
@@ -578,7 +628,7 @@ def _check_changed_graph(
             _assert_output(out, expected)
             for head in range(num_kv_heads):
                 hs = slice(head * head_group_ratio, (head + 1) * head_group_ratio)
-                _assert_output(out[:, hs], expected[:, hs])
+                _assert_output(out[..., hs, :], expected[..., hs, :])
             assert (backing[-1] == 19).all()
             assert (workspace.semaphores == 0).all()
             for row, length in enumerate(lengths):
@@ -617,6 +667,60 @@ def _check_module_case(lengths, mode):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_multi_query_groups_and_mask(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "flashinfer/experimental/xqa_decode_buckets/geometry.py"
+        )
+        spec = importlib.util.spec_from_file_location("xqa_multi_geometry", path)
+        geometry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(geometry)
+        for tokens in range(1, 6):
+            words = geometry.causal_mask_words(tokens)
+            for row, word in enumerate(words):
+                self.assertEqual(
+                    [bool(word & (1 << col)) for col in range(tokens)],
+                    [col <= row for col in range(tokens)],
+                )
+                self.assertEqual(word >> tokens, 0)
+            for heads in (1, 2, 8):
+                for ratio in (4, 6, 8):
+                    self.assertEqual(
+                        geometry.query_group_count(heads, ratio, tokens),
+                        heads * ((tokens * ratio + 15) // 16),
+                    )
+        self.assertEqual(geometry.plan_geometry(4, 16, 170, 32, 8, 8, 5), (8, True))
+        self.assertEqual(geometry.plan_geometry(4, 17, 170, 32, 8, 8, 5), (8, False))
+        self.assertEqual(geometry.plan_geometry(13, 257, 170, 32, 8, 8, 5), (13, False))
+        for tokens in (True, 0, 6, 2.0):
+            with self.assertRaises(ValueError):
+                geometry.query_group_count(1, 6, tokens)
+        with self.assertRaises(ValueError):
+            geometry.query_group_count((1 << 31) - 1, 8, 5)
+
+    def test_causal_reference(self):
+        # Zero logits make each row the known mean of its visible V prefix.
+        query = torch.zeros((1, 5, 4, 256), dtype=torch.bfloat16)
+        key = torch.zeros((1, 16, 1, 128), dtype=torch.uint8)
+        value = torch.zeros_like(key)
+        for token, code in enumerate((0x00, 0x22, 0x44, 0x66, 0x77)):
+            value[0, token].fill_(code)
+        sf = torch.ones((1, 16, 1, 16)).to(torch.float8_e4m3fn)
+        table = torch.zeros((1, 1), dtype=torch.int32)
+        actual = _reference(query, [key, value], [sf, sf], table, [5], 1.0, 1.0)
+        expected = (
+            torch.tensor([0, 0.5, 1, 1.75, 2.6], dtype=torch.bfloat16)
+            .view(1, 5, 1, 1)
+            .expand_as(query)
+        )
+        _assert_output(actual, expected)
+        value[0, 4].fill_(0xFF)
+        changed = _reference(query, [key, value], [sf, sf], table, [5], 1.0, 1.0)
+        _assert_output(changed[:, :4], expected[:, :4])
+        self.assertGreater(
+            (changed[:, 4].float() - actual[:, 4].float()).abs().max().item(), 1
+        )
+
     def test_static_capacity_and_validation(self):
         path = (
             Path(__file__).resolve().parents[2]
@@ -881,6 +985,194 @@ class BucketHeadTests(unittest.TestCase):
                     )
 
 
+def _check_future_kv(
+    mode,
+    interleaved,
+    planner="gpu",
+    page_size=32,
+    direct=True,
+    num_kv_heads=1,
+    head_group_ratio=6,
+):
+    _require_sm120()
+    from flashinfer.xqa import create_xqa_decode_bucket_plan, xqa_decode_with_buckets
+
+    tokens, length = 5, 257
+    lengths = [length] if direct else [length, 0, tokens]
+    queries, data, scales, table, lens = _case(
+        lengths,
+        interleaved=interleaved,
+        capacity_length=512 if direct else 8193,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_group_ratio=head_group_ratio,
+        q_len_per_req=tokens,
+    )
+    query = queries[0]
+    query.fill_(0.25)
+    data[0].zero_()
+    data[1].fill_(0x11)
+    for sf in scales:
+        sf.fill_(0.5)
+    page, offset = (length - 1) // page_size, (length - 1) % page_size
+    # A strong final key exposes an accidental future-V contribution immediately.
+    data[0][page, offset].fill_(0x77)
+    plan = create_xqa_decode_bucket_plan(
+        lens,
+        page_table_width=table.shape[1],
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_group_ratio=head_group_ratio,
+        q_len_per_req=tokens,
+        mode=mode,
+        planner=planner,
+        host_seq_lens=torch.tensor(lengths, dtype=torch.int32)
+        if planner == "host"
+        else None,
+    )
+    assert plan.direct == direct
+    workspace, output = plan.create_workspace(), torch.empty_like(query)
+
+    def compute():
+        xqa_decode_with_buckets(
+            query,
+            *data,
+            *scales,
+            table,
+            plan,
+            workspace,
+            bmm1_scale=1 / 16,
+            bmm2_scale=1.3,
+            out=output,
+        )
+
+    compute()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        if planner == "gpu":
+            plan.prepare()
+        compute()
+    if planner == "host":
+        plan.prepare()
+    graph.replay()
+    torch.cuda.synchronize()
+    before = output.clone()
+    _assert_output(before, _reference(query, data, scales, table, lengths, 1 / 16, 1.3))
+    data[1][page, offset].fill_(0xFF)
+    if planner == "host":
+        plan.prepare()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_output(output, _reference(query, data, scales, table, lengths, 1 / 16, 1.3))
+    _assert_output(output[:, :-1], before[:, :-1])
+    assert (output[0, -1].float() - before[0, -1].float()).abs().max().item() > 1
+    assert (workspace.semaphores == 0).all()
+    print(
+        dict(
+            causal_future_v=True,
+            length=length,
+            q_len_per_req=tokens,
+            mode=mode,
+            planner=planner,
+            page_size=page_size,
+            direct=direct,
+            num_kv_heads=num_kv_heads,
+            head_group_ratio=head_group_ratio,
+            resources=plan.resources,
+        ),
+        flush=True,
+    )
+
+
+class BucketMultiQueryTests(unittest.TestCase):
+    def test_causal_partition_smoke(self):
+        _check_future_kv("persistent", False)
+
+    def test_uniform_query_replay(self):
+        _require_sm120()
+        configs = (
+            (2, 2, 4, 16),
+            (3, 4, 6, 32),
+            (4, 4, 4, 32),
+            (5, 8, 8, 64),
+            (3, 1, 6, 16),
+            (5, 1, 4, 32),
+        )
+        for tokens, heads, ratio, page in configs:
+            for mode in ("persistent", "aligned"):
+                for planner in ("gpu", "host"):
+                    for interleaved in (False, True):
+                        with self.subTest(
+                            tokens=tokens,
+                            heads=heads,
+                            ratio=ratio,
+                            page=page,
+                            mode=mode,
+                            planner=planner,
+                            interleaved=interleaved,
+                        ):
+                            _check_changed_graph(
+                                mode,
+                                interleaved,
+                                planner=planner,
+                                page_size=page,
+                                num_kv_heads=heads,
+                                head_group_ratio=ratio,
+                                q_len_per_req=tokens,
+                            )
+
+    def test_direct_query_replay(self):
+        _require_sm120()
+        for tokens, heads, ratio, page in ((2, 2, 4, 16), (3, 4, 6, 32), (5, 8, 8, 64)):
+            for mode in ("persistent", "aligned"):
+                for planner in ("gpu", "host"):
+                    for batch, capacity in ((1, 131072), (4, 512)):
+                        _check_changed_graph(
+                            mode,
+                            True,
+                            planner=planner,
+                            page_size=page,
+                            num_kv_heads=heads,
+                            head_group_ratio=ratio,
+                            q_len_per_req=tokens,
+                            direct=True,
+                            direct_batch=batch,
+                            capacity_length=capacity,
+                        )
+
+    def test_future_kv_perturbation(self):
+        for page in (16, 32, 64):
+            for direct in (False, True):
+                for mode in ("persistent", "aligned"):
+                    for planner in ("gpu", "host"):
+                        _check_future_kv(mode, page != 32, planner, page, direct)
+        for mode in ("persistent", "aligned"):
+            for planner in ("gpu", "host"):
+                for interleaved in (False, True):
+                    _check_future_kv(
+                        mode,
+                        interleaved,
+                        planner,
+                        direct=False,
+                        num_kv_heads=2,
+                        head_group_ratio=4,
+                    )
+
+    def test_q1_compatibility_anchor(self):
+        _check_changed_graph("persistent", False, direct=True, capacity_length=512)
+        _check_changed_graph("persistent", True, num_kv_heads=4, head_group_ratio=6)
+        _check_changed_graph(
+            "aligned",
+            False,
+            num_kv_heads=2,
+            head_group_ratio=4,
+            direct=True,
+            direct_batch=4,
+            capacity_length=512,
+        )
+
+
 class HostPlannerTests(unittest.TestCase):
     def test_descriptor_abi_and_validation(self):
         _require_sm120()
@@ -961,6 +1253,7 @@ class HostPlannerTests(unittest.TestCase):
                         host.ctas,
                         4096,
                         mode == "aligned",
+                        1,
                     )
             host_lengths.zero_()
             graph = torch.cuda.CUDAGraph()
@@ -999,6 +1292,11 @@ class HostPlannerTests(unittest.TestCase):
                     page_table_width=4096,
                     num_kv_heads=heads,
                     head_group_ratio=ratio,
+                )
+        for tokens in (True, 0, 6, 2.0):
+            with self.assertRaises(ValueError):
+                create_xqa_decode_bucket_plan(
+                    lens, page_table_width=4096, q_len_per_req=tokens
                 )
         with self.assertRaisesRegex(ValueError, "grid-Y"):
             create_xqa_decode_bucket_plan(

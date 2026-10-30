@@ -16,6 +16,8 @@ from ...utils import (
 from .jit import get_module
 from .geometry import (
     check_head_config,
+    causal_mask_words,
+    query_group_count,
     plan_capacity,
     plan_geometry,
     workspace_capacity,
@@ -70,12 +72,14 @@ def _prepare(
     aligned: bool,
     page_size: int,
     head_group_ratio: int,
+    q_len_per_req: int,
 ) -> None:
     module, _ = get_module(
         not aligned,
         lengths.device,
         page_size=page_size,
         head_group_ratio=head_group_ratio,
+        multi_query=q_len_per_req > 1,
     )
     module.plan(lengths, tasks, requests, spans, header, ctas, aligned)
 
@@ -91,6 +95,7 @@ def _fake_prepare(
     aligned: bool,
     page_size: int,
     head_group_ratio: int,
+    q_len_per_req: int,
 ) -> None:
     pass
 
@@ -111,6 +116,7 @@ def _compute(
     requests: torch.Tensor,
     spans: torch.Tensor,
     header: torch.Tensor,
+    causal_mask: torch.Tensor,
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
     output: torch.Tensor,
@@ -121,6 +127,7 @@ def _compute(
     enable_pdl: bool,
     page_size: int,
     head_group_ratio: int,
+    q_len_per_req: int,
 ) -> None:
     # Empty headers are the factory's explicit static direct-plan representation.
     direct = header.numel() == 0
@@ -130,6 +137,7 @@ def _compute(
         direct=direct,
         page_size=page_size,
         head_group_ratio=head_group_ratio,
+        multi_query=q_len_per_req > 1,
     )
     module.run(
         q,
@@ -143,6 +151,7 @@ def _compute(
         requests,
         spans,
         header,
+        causal_mask,
         semaphores,
         scratch,
         output,
@@ -151,6 +160,7 @@ def _compute(
         bmm1_scale,
         bmm2_scale,
         enable_pdl,
+        q_len_per_req,
     )
 
 
@@ -167,6 +177,7 @@ def _fake_compute(
     requests: torch.Tensor,
     spans: torch.Tensor,
     header: torch.Tensor,
+    causal_mask: torch.Tensor,
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
     output: torch.Tensor,
@@ -177,6 +188,7 @@ def _fake_compute(
     enable_pdl: bool,
     page_size: int,
     head_group_ratio: int,
+    q_len_per_req: int,
 ) -> None:
     pass
 
@@ -219,6 +231,9 @@ class BucketPlan:
     page_size: int
     num_kv_heads: int
     head_group_ratio: int
+    q_len_per_req: int
+    num_groups: int
+    causal_mask: torch.Tensor
     grid_y_limit: int
     mode: str
     scratch_bytes: int
@@ -249,6 +264,7 @@ class BucketPlan:
                     self.lengths.device,
                     page_size=self.page_size,
                     head_group_ratio=self.head_group_ratio,
+                    multi_query=self.q_len_per_req > 1,
                 )
                 module.plan_host(
                     self.host_seq_lens,
@@ -256,6 +272,7 @@ class BucketPlan:
                     self.ctas,
                     self.table_width,
                     self.mode == "aligned",
+                    self.q_len_per_req,
                 )
                 self._device_descriptors.copy_(
                     self._host_descriptors, non_blocking=True
@@ -272,6 +289,7 @@ class BucketPlan:
                 self.mode == "aligned",
                 self.page_size,
                 self.head_group_ratio,
+                self.q_len_per_req,
             )
         return self
 
@@ -282,7 +300,7 @@ class BucketPlan:
                 self.scratch_bytes, dtype=torch.uint8, device=self.lengths.device
             ),
             torch.zeros(
-                self.lengths.numel() * self.num_kv_heads,
+                self.lengths.numel() * self.num_groups,
                 dtype=torch.int32,
                 device=self.lengths.device,
             ),
@@ -299,8 +317,10 @@ def create_plan(
     host_seq_lens=None,
     num_kv_heads=1,
     head_group_ratio=6,
+    q_len_per_req=1,
 ):
     check_head_config(num_kv_heads, head_group_ratio)
+    groups = query_group_count(num_kv_heads, head_group_ratio, q_len_per_req)
     if mode not in ("persistent", "aligned"):
         raise ValueError("mode must be persistent or aligned")
     if planner not in ("gpu", "host"):
@@ -319,13 +339,19 @@ def create_plan(
     elif host_seq_lens is not None:
         raise ValueError("host_seq_lens is only used with planner='host'")
     ctas, direct = plan_geometry(
-        batch, page_table_width, get_device_sm_count(device), page_size, num_kv_heads
+        batch,
+        page_table_width,
+        get_device_sm_count(device),
+        page_size,
+        num_kv_heads,
+        head_group_ratio,
+        q_len_per_req,
     )
     capacity = plan_capacity(batch, ctas, page_table_width, page_size)
     total_capacity = workspace_capacity(
-        batch, ctas, page_table_width, page_size, num_kv_heads
+        batch, ctas, page_table_width, page_size, groups
     )
-    if batch * num_kv_heads * head_group_ratio > (1 << 32) - 1:
+    if batch * num_kv_heads * head_group_ratio * q_len_per_req > (1 << 32) - 1:
         raise ValueError("Native query head indices must fit uint32")
     module, resources = get_module(
         mode == "persistent" and not direct,
@@ -333,11 +359,24 @@ def create_plan(
         direct=direct,
         page_size=page_size,
         head_group_ratio=head_group_ratio,
+        multi_query=q_len_per_req > 1,
     )
     grid_y_limit = module.grid_y_limit(device.index)
-    if num_kv_heads > grid_y_limit:
-        raise ValueError(f"num_kv_heads exceeds device grid-Y limit {grid_y_limit}")
+    if groups > grid_y_limit:
+        raise ValueError(f"Query/head groups exceed device grid-Y limit {grid_y_limit}")
     scratch_bytes = module.scratch_bytes(total_capacity)
+    if q_len_per_req > 1:
+        # Cold constant suffix mask, packed exactly like native XQA. No mask
+        # generation or length readback is part of prepare/compute/replay.
+        causal_mask = torch.tensor(causal_mask_words(q_len_per_req), dtype=torch.int32)
+        causal_mask = (
+            causal_mask.repeat(batch, 1)
+            .view(torch.uint16)
+            .reshape(batch, q_len_per_req, 2)
+            .to(device)
+        )
+    else:
+        causal_mask = torch.empty(0, dtype=torch.uint16, device=device)
     host_descriptors = device_descriptors = copy_done = None
     if planner == "host" and not direct:
         words = 6 * (ctas + batch)
@@ -369,6 +408,9 @@ def create_plan(
         page_size,
         num_kv_heads,
         head_group_ratio,
+        q_len_per_req,
+        groups,
+        causal_mask,
         grid_y_limit,
         mode,
         scratch_bytes,
@@ -402,7 +444,12 @@ def run(
     if not isinstance(plan, BucketPlan) or not isinstance(workspace, BucketWorkspace):
         raise TypeError("Expected a bucket plan and its caller-owned workspace")
     device, batch = plan.lengths.device, plan.lengths.numel()
-    shape = (batch, plan.num_kv_heads * plan.head_group_ratio, 256)
+    query_heads = plan.num_kv_heads * plan.head_group_ratio
+    shape = (
+        (batch, query_heads, 256)
+        if plan.q_len_per_req == 1
+        else (batch, plan.q_len_per_req, query_heads, 256)
+    )
     _tensor(
         query, "query", dtype=torch.bfloat16, shape=shape, device=device, alignment=16
     )
@@ -450,7 +497,7 @@ def run(
         workspace.semaphores,
         "semaphores",
         dtype=torch.int32,
-        shape=(batch * plan.num_kv_heads,),
+        shape=(batch * plan.num_groups,),
         device=device,
     )
     if not all(math.isfinite(float(s)) for s in (bmm1_scale, bmm2_scale)):
@@ -480,6 +527,7 @@ def run(
             plan.requests,
             plan.spans,
             plan.header,
+            plan.causal_mask,
             workspace.semaphores,
             workspace.scratch,
             out,
@@ -490,5 +538,6 @@ def run(
             enable_pdl,
             plan.page_size,
             plan.head_group_ratio,
+            plan.q_len_per_req,
         )
     return out

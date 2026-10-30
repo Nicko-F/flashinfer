@@ -25,15 +25,18 @@ inline int64_t descriptor_words(int batch, int ctas) {
 // Keep the ownership arithmetic identical to assign; only its execution moves
 // to the CPU. The GPU planner retains its parallel task/span fill.
 inline void plan_host(const int* lengths, int* storage, int batch, int ctas,
-                      int table_width, bool aligned, int page_size = 32) {
+                      int table_width, bool aligned, int page_size = 32, int q_len_per_req = 1) {
   if (batch < 1 || batch > MaxBatch || ctas < batch || ctas > INT32_MAX - MaxBatch ||
       (page_size != 16 && page_size != 32 && page_size != 64) ||
-      table_width < 1 || table_width > max_table_width(page_size))
+      table_width < 1 || table_width > max_table_width(page_size) ||
+      q_len_per_req < 1 || q_len_per_req > 5)
     throw std::invalid_argument("Invalid host bucket plan geometry");
   int prefix[MaxBatch + 1] = {}, base[MaxBatch + 1] = {}, first[MaxBatch];
   for (int r = 0; r < batch; ++r) {
     if (lengths[r] < 0 || int64_t(lengths[r]) > int64_t(table_width) * page_size)
       throw std::invalid_argument("Host sequence lengths must fit the page table capacity");
+    if (lengths[r] != 0 && lengths[r] < q_len_per_req)
+      throw std::invalid_argument("Active KV lengths must include the full query suffix");
     prefix[r + 1] = prefix[r] + direct_tile_count(lengths[r]);
   }
   auto ceil_div = [](int a, int b) { return a / b + (a % b != 0); };

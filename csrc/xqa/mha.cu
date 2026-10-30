@@ -862,7 +862,7 @@ __device__ inline GemmOutRegTile loadGemmOutTile(Warp const& warp,
 __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, uint32_t nbQHeads,
 #if SPEC_DEC
                                              uint32_t headGrpSize, uint32_t idxHeadGrpOffset,
-                                             uint32_t nbValidHeadTokens,
+                                             uint32_t nbValidHeadTokens, uint32_t actualQSeqLen,
 #else
                                              uint32_t idxHeadGrp,
 #endif
@@ -892,7 +892,13 @@ __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, 
 #endif
       break;
     }
+#if SPEC_DEC
+    // m includes the row-block offset; only r is local to the physical tile.
+    assert(r < nbValidRows);
+    assert(m < actualQSeqLen * headGrpSize);
+#else
     assert(m < nbValidRows);
+#endif
 #if SPEC_DEC
     uint32_t const idxBeam = 0;
     uint32_t const idxInGrp = m;
@@ -900,7 +906,7 @@ __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, 
     uint32_t const headIdx = idxInGrp % headGrpSize;
     assert(idxBeam < beamWidth);
     uint32_t const idxHead = idxHeadGrpOffset + tokenIdx * nbQHeads + headIdx;
-    assert(idxHead < nbValidHeadTokens * nbQHeads);
+    assert(idxHead < actualQSeqLen * nbQHeads);
 #else
     uint32_t const idxBeam = m / headGrpSize;
     uint32_t const idxInGrp = m % headGrpSize;
@@ -1731,9 +1737,14 @@ CUBIN_EXPORT __global__
   uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
   uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
 
+#if FLASHINFER_XQA_TASKS
+  uint32_t const idxHeadGrp = task.head_group;
+  uint32_t const idxHeadTokenInGrp = task.head_token_begin;
+#else
   uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
   uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
   uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
+#endif
   uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
   uint32_t const nbValidHeadTokens =
       idxHeadTokenInGrp > totalNbHeadTokensInGrp
@@ -1812,10 +1823,19 @@ CUBIN_EXPORT __global__
 #endif
 
 #if FLASHINFER_XQA_TASKS
+  uint32_t const logicalCacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
   uint32_t const cacheSeqLen =
-      mha::min(getCacheSeqLen<usePagedKVCache>(cacheList, idxReq), task.end_tile * ctaTile.x);
+      mha::min(logicalCacheSeqLen, task.end_tile * ctaTile.x);
 #else
   uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+#endif
+#if SPEC_DEC
+#if FLASHINFER_XQA_TASKS
+  // Causal suffix positions belong to the full request, never a clipped task.
+  uint32_t const maskCacheSeqLen = logicalCacheSeqLen;
+#else
+  uint32_t const maskCacheSeqLen = cacheSeqLen;
+#endif
 #endif
 #if SLIDING_WINDOW
   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
@@ -1847,7 +1867,7 @@ CUBIN_EXPORT __global__
 
   uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
 #if SPEC_DEC
-  uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+  uint32_t const nbSeqItersWithoutMask = (maskCacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
 #if FLASHINFER_XQA_TASKS
@@ -2151,7 +2171,7 @@ CUBIN_EXPORT __global__
 #endif
       if (seqIter >= nbSeqItersWithoutMask || needWinEdgeMask) {
         uint32_t const nbValidCols =
-            (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
+            (warpTileTokenBeg < maskCacheSeqLen ? maskCacheSeqLen - warpTileTokenBeg : 0U);
         applyMaskFromInput(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen,
                            headGrpSize
 #if SLIDING_WINDOW
@@ -2749,7 +2769,7 @@ CUBIN_EXPORT __global__
       uint32_t const dstColOffset = warpTile.x * (warpIdxInGrp + gemm1WarpsPerGrp * hs);
 #if SPEC_DEC
       copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
-                            (idxHeadGrp * headGrpSize), nbValidHeadTokens,
+                            (idxHeadGrp * headGrpSize), nbValidHeadTokens, actualQSeqLen,
                             uint2{dstColOffset, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
                             smemOutTile);
 #else
@@ -2771,8 +2791,13 @@ CUBIN_EXPORT __global__
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
       // Includes both kHeads and qTokens.
+#if FLASHINFER_XQA_TASKS
+      uint32_t const nbIndepHeadTokens = task.group_count;
+      uint32_t const indepHeadTokenIdx = task.group;
+#else
       uint32_t const nbIndepHeadTokens = gridDim.y;
       uint32_t const indepHeadTokenIdx = blockIdx.y;
+#endif
       uint32_t const nbSeq = nbIndepHeadTokens * batchSize;
 #else
       uint32_t const nbSeq = nbKHeads * batchSize;

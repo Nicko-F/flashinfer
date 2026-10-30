@@ -45,11 +45,12 @@ def create_xqa_decode_bucket_plan(
     page_size: int = 32,
     num_kv_heads: int = 1,
     head_group_ratio: int = 6,
+    q_len_per_req: int = 1,
     mode: str = "persistent",
     planner: str = "gpu",
     host_seq_lens: Optional[torch.Tensor] = None,
 ):
-    """Allocate and prepare an experimental reusable q1 Decode work plan.
+    """Allocate and prepare an experimental reusable uniform Decode work plan.
 
     ``seq_lens`` is contiguous CUDA int32 ``[B]`` storage with ``1 <= B <= 32``.
     ``page_size`` is 16, 32 (default), or 64 tokens. Length values must stay
@@ -90,6 +91,15 @@ def create_xqa_decode_bucket_plan(
     per group; scratch and request counters are independent. Direct selection
     uses this per-group budget in place of the single-group SM count above.
 
+    ``q_len_per_req`` is a uniform query length in [1,5], default 1. T1 retains
+    the existing rank3 query/output shape; T>1 uses ``[B,T,H*R,256]``. KV lengths
+    include the complete T-token causal suffix: active lengths must be at least
+    T, or zero for padded requests. Query row t sees keys before ``L-T+t+1``.
+    A constant packed causal mask is allocated once with the plan. Groups are
+    ``H * ceil(T*R/16)``; planning budgets, scratch and counters use that count.
+    No ragged queries, arbitrary tree masks or speculative-generation service
+    are enabled by this explicit module call.
+
     This explicit call opts into the experimental SM120 backend. No model,
     TP degree, layer count or configured maximum context length is required.
     See ``flashinfer/experimental/xqa_decode_buckets/README.md`` for limits.
@@ -102,6 +112,7 @@ def create_xqa_decode_bucket_plan(
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         head_group_ratio=head_group_ratio,
+        q_len_per_req=q_len_per_req,
         mode=mode,
         planner=planner,
         host_seq_lens=host_seq_lens,
@@ -124,12 +135,15 @@ def xqa_decode_with_buckets(
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Run q1 native XQA math using an experimental work plan.
+    """Run native XQA math using an experimental uniform-query work plan.
 
     Supports SM120 BF16 Q/output ``[B,H*R,256]``, with ``H=plan.num_kv_heads``
     and ``R=plan.head_group_ratio``. NHD NVFP4 K/V is ``[pages,P,H,128]`` and
     E4M3 block scales are ``[pages,P,H,16]``, with ``P=plan.page_size`` in
-    {16,32,64}. One query token is supported per request.
+    {16,32,64}. At ``T=plan.q_len_per_req > 1``, Q/output use ``[B,T,H*R,256]``
+    and a causal suffix already included in each live KV length. Active KV
+    lengths must be >=T, with zero reserved for padded requests. Device-value
+    preconditions are caller-owned and are not read back during replay.
     Packed data and scale byte strides are retained.
     ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
     reached by live lengths must address allocated cache pages. Zero-length

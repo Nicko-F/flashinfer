@@ -73,6 +73,7 @@ def compare_planners(args):
                 page_size=args.page_size,
                 num_kv_heads=args.num_kv_heads,
                 head_group_ratio=args.head_group_ratio,
+                q_len_per_req=args.q_len_per_req,
                 mode=args.mode,
                 planner=planner,
                 host_seq_lens=cpu_lengths if planner == "host" else None,
@@ -83,7 +84,14 @@ def compare_planners(args):
         for _ in range(args.layers):
             q = (
                 torch.randn(
-                    (batch, args.num_kv_heads * args.head_group_ratio, 256),
+                    (batch, args.num_kv_heads * args.head_group_ratio, 256)
+                    if args.q_len_per_req == 1
+                    else (
+                        batch,
+                        args.q_len_per_req,
+                        args.num_kv_heads * args.head_group_ratio,
+                        256,
+                    ),
                     dtype=torch.bfloat16,
                     device=args.device,
                 )
@@ -168,10 +176,16 @@ def compare_planners(args):
                 lens.device,
                 page_size=args.page_size,
                 head_group_ratio=args.head_group_ratio,
+                multi_query=args.q_len_per_req > 1,
             )
             staging = torch.empty_like(host._host_descriptors, pin_memory=True)
             fill = lambda: module.plan_host(
-                cpu_lengths, staging, host.ctas, width, args.mode == "aligned"
+                cpu_lengths,
+                staging,
+                host.ctas,
+                width,
+                args.mode == "aligned",
+                args.q_len_per_req,
             )
             for _ in range(5):
                 fill()
@@ -202,6 +216,8 @@ def compare_planners(args):
             scenario=label,
             num_kv_heads=args.num_kv_heads,
             head_group_ratio=args.head_group_ratio,
+            q_len_per_req=args.q_len_per_req,
+            groups=host.num_groups,
             page_size=args.page_size,
             lengths=lengths,
             layers=args.layers,
@@ -243,6 +259,7 @@ def main():
     parser.add_argument("--page-size", type=int, choices=(16, 32, 64), default=32)
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--head-group-ratio", type=int, choices=(4, 6, 8), default=6)
+    parser.add_argument("--q-len-per-req", type=int, choices=(1, 2, 3, 4, 5), default=1)
     parser.add_argument(
         "--capacity-length", type=int, help="Reserved table capacity in tokens"
     )
@@ -273,6 +290,8 @@ def main():
     lengths = [int(n) for n in args.lengths.split(",")]
     if not 1 <= len(lengths) <= 32 or min(lengths) < 1 or args.layers < 1:
         parser.error("Use 1-32 positive lengths and at least one layer")
+    if min(lengths) < args.q_len_per_req:
+        parser.error("Active KV lengths must include the complete query suffix")
     capacity = max(lengths) if args.capacity_length is None else args.capacity_length
     if capacity < max(lengths):
         parser.error("--capacity-length must cover every live length")
@@ -296,12 +315,20 @@ def main():
         mode=args.mode,
         num_kv_heads=args.num_kv_heads,
         head_group_ratio=args.head_group_ratio,
+        q_len_per_req=args.q_len_per_req,
     )
     bank = []
     for _ in range(args.layers):
         q = (
             torch.randn(
-                (len(lengths), args.num_kv_heads * args.head_group_ratio, 256),
+                (len(lengths), args.num_kv_heads * args.head_group_ratio, 256)
+                if args.q_len_per_req == 1
+                else (
+                    len(lengths),
+                    args.q_len_per_req,
+                    args.num_kv_heads * args.head_group_ratio,
+                    256,
+                ),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -353,7 +380,7 @@ def main():
     def native():
         for q, k, v, ks, vs, _, native_out, _, scratch in bank:
             xqa_batch_decode_with_kv_cache(
-                q,
+                q.view(-1, args.num_kv_heads * args.head_group_ratio, 256),
                 (k, v),
                 scratch,
                 table,
@@ -361,8 +388,10 @@ def main():
                 max(lengths),
                 bmm1_scale=0.7 / 16,
                 bmm2_scale=1.3,
-                out=native_out,
+                out=native_out.view(-1, args.num_kv_heads * args.head_group_ratio, 256),
                 kv_cache_sf=(ks, vs),
+                q_len_per_req=args.q_len_per_req,
+                mask=plan.causal_mask if args.q_len_per_req > 1 else None,
             )
 
     native()
@@ -397,6 +426,8 @@ def main():
             page_size=args.page_size,
             num_kv_heads=args.num_kv_heads,
             head_group_ratio=args.head_group_ratio,
+            q_len_per_req=args.q_len_per_req,
+            groups=plan.num_groups,
             direct=plan.direct,
             assignment_per_window=0 if plan.direct else 1,
         ),
@@ -420,7 +451,7 @@ def main():
                         partial_count=parts,
                         group_stride=parts if len(live_lengths) == 1 else plan.ctas,
                         total_slots=(parts if len(live_lengths) == 1 else plan.ctas)
-                        * args.num_kv_heads,
+                        * plan.num_groups,
                         intervals=[
                             [i * tiles // parts, (i + 1) * tiles // parts]
                             for i in range(parts)
@@ -431,13 +462,13 @@ def main():
                 source="derived from live device length outside timed region",
                 representation="direct_empty_descriptors",
                 request_bounds_derived=request_bounds,
-                grid=[per_request, args.num_kv_heads, len(live_lengths)],
+                grid=[per_request, plan.num_groups, len(live_lengths)],
                 ctas_per_group=plan.ctas,
-                grid_ctas=plan.ctas * args.num_kv_heads,
+                grid_ctas=plan.ctas * plan.num_groups,
                 nonempty_tile_ctas_derived=sum(
                     r["partial_count"] for r in request_bounds
                 )
-                * args.num_kv_heads,
+                * plan.num_groups,
             )
             print(
                 dict(
@@ -454,9 +485,9 @@ def main():
                 header=header,
                 tasks=plan.tasks[: header[1]].cpu().tolist(),
                 requests=plan.requests.cpu().tolist(),
-                grid_ctas=plan.ctas * args.num_kv_heads,
+                grid_ctas=plan.ctas * plan.num_groups,
                 ctas_per_group=plan.ctas,
-                active_ctas=header[2] * args.num_kv_heads,
+                active_ctas=header[2] * plan.num_groups,
             )
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         splits = min(
@@ -467,7 +498,7 @@ def main():
             dict(
                 plan_topology=topology,
                 native_launch_derived=dict(
-                    source="csrc/xqa/mha.cu:3211-3222",
+                    source="csrc/xqa/mha.cu:launchMHA",
                     formula="splits=min(max(1,SMs/(B*KVheads)),ceil(table_width*page_size/256))",
                     sm_count=sms,
                     kv_heads=args.num_kv_heads,
@@ -477,6 +508,12 @@ def main():
                         min(splits, (n + 255) // 256) for n in lengths
                     )
                     * args.num_kv_heads,
+                )
+                if args.q_len_per_req == 1
+                else dict(
+                    source="native public XQA default multi-query dispatch",
+                    q_len_per_req=args.q_len_per_req,
+                    kv_heads=args.num_kv_heads,
                 ),
                 compute_math="native QK/PV; transposed compute is not implemented",
             ),
