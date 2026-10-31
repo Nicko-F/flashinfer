@@ -672,3 +672,61 @@ and model/serving integration remain separate work.
 Use `--query-tile 32 --q-len-per-req 3` for an explicit M32 example, or compare
 the same four cases with `--suite query_tiles4 --layers 1 --output-json tiles.json`.
 The comparison JSON retains both candidates' resource, error and timing records.
+
+## Existing M32 ownership modes (2026-10-31 UTC)
+
+One four-case diagnostic invocation compared existing persistent and aligned M32
+modes with shared Q/KV/scales/page tables, the same constant mask tensor and
+native outputs, plus independent candidate plans, outputs and workspaces.
+Kernels, public API and defaults are unchanged; prior correctness and zero-spill
+compiler qualification remain applicable. All four before/after output and
+counter checks passed. Maximum relative RMS error across both modes was
+0.0041943, and maximum native-before/after median drift was 0.302%.
+
+GPU0-6 were busy at admission. This run used idle RTX 5090 physical GPU7 with
+NUMA1 CPU affinity for every arm, with at least 128GiB host memory available.
+Its current native controls define the comparisons below; absolute historical
+GPU0 timings are separate evidence. The single-attention helper protocol is
+unchanged: seed0, static device lengths, five warmups and twenty hot CUDA Graph
+samples per arm, CUPTI off and cold-L2 handling off. JIT, allocation and descriptor
+readback are excluded. Each full candidate window includes one GPU Assign.
+Units are microseconds. Native speedup uses the mean native medians; mode
+speedup uses the persistent full median, each divided by aligned's full median.
+Independently measured components are not assumed additive.
+
+| P/H/R/T | Length pattern | Native before / after | Persistent compute / full | Aligned compute / full | Aligned vs persistent full | Aligned vs native full |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 32/4/6/3 | 32 x 512 | 24.131 / 24.131 | 24.746 / 31.094 | 24.541 / 30.376 | 1.02x | 0.79x |
+| 32/4/6/3 | 32 x 4096 | 158.790 / 158.787 | 221.099 / 229.034 | 161.245 / 168.824 | 1.36x | 0.94x |
+| 32/4/6/3 | 65536 + 7 x 4096 | 474.640 / 476.074 | 106.768 / 111.582 | 167.187 / 173.432 | 0.64x | 2.74x |
+| 64/8/8/5 | 65536 + 7 x 4096 | 1118.224 / 1118.226 | 596.293 / 599.416 | 577.194 / 578.730 | 1.04x | 1.93x |
+
+Actual device descriptors confirm the uniform4096 ownership prediction. Per
+query/head group, persistent uses a twelve-tile budget, 64 tasks and 43 active
+owners; 21 owners process two tasks, and every request has two partials. Across
+four groups, all 172 launched CTAs are active. Aligned uses a sixteen-tile budget
+and 32 whole-request tasks, with no inter-CTA request merge: 128 active CTAs in
+the same 172-CTA capacity grid. The generic native SM120 source derives one split
+and grid `(1,4,32)`, or 128 CTAs with no inter-CTA merge. Native counts are
+source-derived; bucket counts come from meaningful descriptors copied outside
+timing. Neither is presented as a profiler launch measurement.
+
+Aligned removes most of the balanced4K compute gap in this comparison, while
+its 168.824 us full window remains 6.32% slower than the 158.789 us native mean.
+Ownership, task restarts,
+barriers and generated code differ together, so this does not isolate merge cost.
+Aligned is substantially slower on the T3 skew case despite both modes using a
+nine-tile budget and 29 partials for the long request; partial counts alone do
+not explain that result. Both modes remain explicit alternatives, with no
+automatic length threshold, default switch or universal performance claim.
+
+Runtime resources retain 86,656 shared bytes and one resident CTA per SM. R6/P32
+persistent/aligned report 219/228 registers and a 112-byte stack; R8/P64 report
+232/223 registers and a 64-byte stack. These unchanged specializations reuse the
+prior zero-spill compiler evidence. No additional correctness matrix, broader
+curve or service run was performed.
+
+Use `--suite query_modes4 --layers 1 --output-json ownership.json` to reproduce
+the finite comparison. Its JSON includes raw samples, output errors, resources,
+meaningful descriptors and owner/partial histograms. The native launch report
+uses the generic SM120 M32 mapping with its source basis explicitly recorded.

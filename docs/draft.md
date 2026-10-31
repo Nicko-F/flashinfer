@@ -56,6 +56,15 @@ paired measurements. The native core uses256threads and70,272shared bytes in
 the tested q1 configurations, one resident CTA/SM and zero compiler spills.
 Registers vary with page size and mode; remeasure new specializations.
 
+The subsequent M32 ownership comparison keeps the core and both modes unchanged.
+For B32/T3/R6 uniform4096, persistent ownership splits every request and requires
+two-task owners; aligned ownership keeps complete requests. Actual descriptors
+confirm this distinction. Matched compute medians are221.099us persistent,
+161.245us aligned and158.789us native. Planning-inclusive aligned is168.824us,
+still slower than native. Mixed T3 requests instead favor persistent111.582us
+over aligned173.432us full windows. Thus routing needs workload evidence; neither
+mode is a universally faster backend. The report retains all four comparisons.
+
 These are module results. vLLM runtime integration, service gains and upstream PR
 acceptance remain pending. Retain source facts, predictions and measurements as
 separate claims. See [the execution plan](plan.md) for the next stage.

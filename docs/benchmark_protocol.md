@@ -78,3 +78,11 @@ both candidates; each candidate retains separate compute-only and complete
 planning-inclusive windows. The same helper, precision and sampling settings
 above apply. This diagnoses the M16 row-group split; it does not replace the
 22-case historical matrix or constitute a new full performance qualification.
+
+`--suite query_modes4` subsequently compares existing persistent/aligned M32
+ownership on those same four workloads. Both arms share Q/KV/scales/page tables
+and the constant causal mask, with independent outputs/plans/workspaces. Actual
+device descriptors and owner/partial counts are copied outside timing. Generic
+SM120 native grids are explicitly marked source-derived, not profiler-observed.
+One native bracket surrounds both modes. Compare within the matched physical
+GPU/NUMA run; historical timings on another GPU are context, not direct controls.
