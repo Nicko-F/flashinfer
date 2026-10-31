@@ -65,6 +65,23 @@ still slower than native. Mixed T3 requests instead favor persistent111.582us
 over aligned173.432us full windows. Thus routing needs workload evidence; neither
 mode is a universally faster backend. The report retains all four comparisons.
 
+The public API now has an actual local torch.library dispatcher boundary for
+Inductor, with declared plan/workspace/output mutations and fake implementations.
+Direct and prepared calls, Host-prepared consumers and two independent layers
+sharing one plan passed real fullgraph execution and changed-input CUDA Graph
+replay. Generated code retains one plan and two compute calls for that shared
+window, without unconditional workspace cloning. This is compile compatibility
+and metadata reuse, not fusion of the two attention kernels. The exact FP8
+schema-checker limitation and compiler input-realignment behavior are documented
+in the module report; complete opcheck success is not claimed.
+
+One matched B32 x 4096 two-layer M32/aligned window measured 337.066 us with
+per-layer planning, 330.102 us with shared planning and 331.997 us with compiled
+shared planning. Native before/after 317.920/322.730 us brackets the comparison.
+The observed plan-reuse reduction is 2.07%; the shared window still regresses
+against native. A 1.50% native bracket drift is larger than the 0.57% eager versus
+compiled difference, so no compiler speedup is claimed.
+
 These are module results. vLLM runtime integration, service gains and upstream PR
 acceptance remain pending. Retain source facts, predictions and measurements as
 separate claims. See [the execution plan](plan.md) for the next stage.

@@ -10,8 +10,6 @@ from ...utils import (
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
-    register_custom_op,
-    register_fake_op,
 )
 from .jit import get_module
 from .geometry import (
@@ -24,7 +22,7 @@ from .geometry import (
 )
 
 
-def _tensor(tensor, name, *, dtype, shape, device, contiguous=True, alignment=1):
+def _tensor(tensor, name, *, dtype, shape, device, contiguous=True):
     if not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype:
         raise TypeError(f"{name} must have dtype {dtype}")
     if tensor.device != device or tensor.device.type != "cuda":
@@ -33,8 +31,27 @@ def _tensor(tensor, name, *, dtype, shape, device, contiguous=True, alignment=1)
         raise ValueError(f"{name} must have shape {tuple(shape)}")
     if contiguous and not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
-    if tensor.data_ptr() % alignment:
-        raise ValueError(f"{name} must have {alignment}-byte aligned storage")
+
+
+def _storage_checks(q, k, v, ks, vs, table, scratch, output):
+    # Real storage only: Dynamo/FakeTensor must not inspect pointers. Both the
+    # raw eager path and registered CUDA implementation call this same check.
+    for name, tensor in (
+        ("query", q),
+        ("k_cache", k),
+        ("v_cache", v),
+        ("k_sf_cache", ks),
+        ("v_sf_cache", vs),
+        ("scratch", scratch),
+        ("out", output),
+    ):
+        if tensor.data_ptr() % 16:
+            raise ValueError(f"{name} must have 16-byte aligned storage")
+    if any(
+        output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
+        for t in (q, k, v, ks, vs, table)
+    ):
+        raise ValueError("out must not alias query, cache or metadata storage")
 
 
 def _host_lengths(lengths, batch):
@@ -58,10 +75,6 @@ def _descriptor_views(storage, batch, ctas):
     )
 
 
-@register_custom_op(
-    "flashinfer::experimental_xqa_bucket_plan",
-    mutates_args=("tasks", "requests", "spans", "header"),
-)
 def _prepare(
     lengths: torch.Tensor,
     tasks: torch.Tensor,
@@ -83,10 +96,10 @@ def _prepare(
         multi_query=q_len_per_req > 1,
         query_tile=query_tile,
     )
-    module.plan(lengths, tasks, requests, spans, header, ctas, aligned)
+    with torch.cuda.device(lengths.device):
+        module.plan(lengths, tasks, requests, spans, header, ctas, aligned)
 
 
-@register_fake_op("flashinfer::experimental_xqa_bucket_plan")
 def _fake_prepare(
     lengths: torch.Tensor,
     tasks: torch.Tensor,
@@ -103,10 +116,6 @@ def _fake_prepare(
     pass
 
 
-@register_custom_op(
-    "flashinfer::experimental_xqa_bucket_compute",
-    mutates_args=("semaphores", "scratch", "output"),
-)
 def _compute(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -133,6 +142,7 @@ def _compute(
     q_len_per_req: int,
     query_tile: int,
 ) -> None:
+    _storage_checks(q, k, v, ks, vs, table, scratch, output)
     # Empty headers are the factory's explicit static direct-plan representation.
     direct = header.numel() == 0
     module, _ = get_module(
@@ -144,32 +154,32 @@ def _compute(
         multi_query=q_len_per_req > 1,
         query_tile=query_tile,
     )
-    module.run(
-        q,
-        k,
-        v,
-        ks,
-        vs,
-        table,
-        lengths,
-        tasks,
-        requests,
-        spans,
-        header,
-        causal_mask,
-        semaphores,
-        scratch,
-        output,
-        ctas,
-        aligned,
-        bmm1_scale,
-        bmm2_scale,
-        enable_pdl,
-        q_len_per_req,
-    )
+    with torch.cuda.device(q.device):
+        module.run(
+            q,
+            k,
+            v,
+            ks,
+            vs,
+            table,
+            lengths,
+            tasks,
+            requests,
+            spans,
+            header,
+            causal_mask,
+            semaphores,
+            scratch,
+            output,
+            ctas,
+            aligned,
+            bmm1_scale,
+            bmm2_scale,
+            enable_pdl,
+            q_len_per_req,
+        )
 
 
-@register_fake_op("flashinfer::experimental_xqa_bucket_compute")
 def _fake_compute(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -197,6 +207,35 @@ def _fake_compute(
     query_tile: int,
 ) -> None:
     pass
+
+
+# Keep this FRAGMENT alive for the lifetime of the module. Shared FlashInfer
+# decorators in some checkouts are no-ops, so register this boundary directly.
+_library = torch.library.Library("flashinfer", "FRAGMENT")
+_library.define(
+    "experimental_xqa_bucket_plan(Tensor lengths, Tensor(a!) tasks, "
+    "Tensor(b!) requests, Tensor(c!) spans, Tensor(d!) header, int ctas, "
+    "bool aligned, int page_size, int head_group_ratio, int q_len_per_req, "
+    "int query_tile) -> ()"
+)
+_library.define(
+    "experimental_xqa_bucket_compute(Tensor q, Tensor k, Tensor v, Tensor ks, Tensor vs, "
+    "Tensor table, Tensor lengths, Tensor tasks, Tensor requests, Tensor spans, Tensor header, "
+    "Tensor causal_mask, Tensor(a!) semaphores, Tensor(b!) scratch, Tensor(c!) output, "
+    "int ctas, bool aligned, float bmm1_scale, float bmm2_scale, bool enable_pdl, "
+    "int page_size, int head_group_ratio, int q_len_per_req, int query_tile) -> ()"
+)
+_library.impl("experimental_xqa_bucket_plan", _prepare, "CUDA")
+_library.impl("experimental_xqa_bucket_compute", _compute, "CUDA")
+_register_fake = (
+    torch.library.register_fake
+    if hasattr(torch.library, "register_fake")
+    else torch.library.impl_abstract
+)
+_register_fake("flashinfer::experimental_xqa_bucket_plan")(_fake_prepare)
+_register_fake("flashinfer::experimental_xqa_bucket_compute")(_fake_compute)
+_prepare_op = torch.ops.flashinfer.experimental_xqa_bucket_plan.default
+_compute_op = torch.ops.flashinfer.experimental_xqa_bucket_compute.default
 
 
 @dataclass(frozen=True)
@@ -245,6 +284,7 @@ class BucketPlan:
     mode: str
     scratch_bytes: int
     resources: tuple
+    enable_pdl: bool
     direct: bool
     planner: str
     host_seq_lens: torch.Tensor | None
@@ -254,6 +294,23 @@ class BucketPlan:
 
     def prepare(self):
         if self.direct:
+            return self
+        if torch.compiler.is_compiling():
+            if self.planner == "host":
+                raise RuntimeError("Host prepare must run outside compiled consumers")
+            _prepare_op(
+                self.lengths,
+                self.tasks,
+                self.requests,
+                self.spans,
+                self.header,
+                self.ctas,
+                self.mode == "aligned",
+                self.page_size,
+                self.head_group_ratio,
+                self.q_len_per_req,
+                self.query_tile,
+            )
             return self
         with torch.cuda.device(self.lengths.device):
             if self.planner == "host":
@@ -430,6 +487,7 @@ def create_plan(
         mode,
         scratch_bytes,
         resources,
+        device_support_pdl(device),
         direct,
         planner,
         host_seq_lens,
@@ -465,9 +523,7 @@ def run(
         if plan.q_len_per_req == 1
         else (batch, plan.q_len_per_req, query_heads, 256)
     )
-    _tensor(
-        query, "query", dtype=torch.bfloat16, shape=shape, device=device, alignment=16
-    )
+    _tensor(query, "query", dtype=torch.bfloat16, shape=shape, device=device)
     _tensor(
         page_table,
         "page_table",
@@ -491,7 +547,6 @@ def run(
             shape=(pages, plan.page_size, plan.num_kv_heads, width),
             device=device,
             contiguous=False,
-            alignment=16,
         )
         if value.stride(-1) != 1 or any(value.stride(i) % unit for i in range(3)):
             raise ValueError(f"{name} must preserve native packed-head byte strides")
@@ -506,7 +561,6 @@ def run(
         dtype=torch.uint8,
         shape=(plan.scratch_bytes,),
         device=device,
-        alignment=16,
     )
     _tensor(
         workspace.semaphores,
@@ -519,41 +573,36 @@ def run(
         raise ValueError("BMM1 and BMM2 scales must be finite")
     if out is None:
         out = torch.empty_like(query)
-    _tensor(out, "out", dtype=torch.bfloat16, shape=shape, device=device, alignment=16)
-    if any(
-        out.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
-        for t in (query, k_cache, v_cache, k_sf_cache, v_sf_cache, page_table)
-    ):
-        raise ValueError("out must not alias query, cache or metadata storage")
+    _tensor(out, "out", dtype=torch.bfloat16, shape=shape, device=device)
     if enable_pdl is None:
-        enable_pdl = device_support_pdl(device)
+        enable_pdl = plan.enable_pdl
     if type(enable_pdl) is not bool:
         raise TypeError("enable_pdl must be a boolean or None")
-    with torch.cuda.device(device):
-        _compute(
-            query,
-            k_cache,
-            v_cache,
-            k_sf_cache,
-            v_sf_cache,
-            page_table,
-            plan.lengths,
-            plan.tasks,
-            plan.requests,
-            plan.spans,
-            plan.header,
-            plan.causal_mask,
-            workspace.semaphores,
-            workspace.scratch,
-            out,
-            plan.ctas,
-            plan.mode == "aligned",
-            float(bmm1_scale),
-            float(bmm2_scale),
-            enable_pdl,
-            plan.page_size,
-            plan.head_group_ratio,
-            plan.q_len_per_req,
-            plan.query_tile,
-        )
+    compute = _compute_op if torch.compiler.is_compiling() else _compute
+    compute(
+        query,
+        k_cache,
+        v_cache,
+        k_sf_cache,
+        v_sf_cache,
+        page_table,
+        plan.lengths,
+        plan.tasks,
+        plan.requests,
+        plan.spans,
+        plan.header,
+        plan.causal_mask,
+        workspace.semaphores,
+        workspace.scratch,
+        out,
+        plan.ctas,
+        plan.mode == "aligned",
+        float(bmm1_scale),
+        float(bmm2_scale),
+        enable_pdl,
+        plan.page_size,
+        plan.head_group_ratio,
+        plan.q_len_per_req,
+        plan.query_tile,
+    )
     return out

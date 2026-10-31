@@ -455,6 +455,7 @@ def main(argv=None):
     parser.add_argument("--query-tile", type=int, choices=(16, 32), default=16)
     parser.add_argument("--compare-query-tiles", action="store_true")
     parser.add_argument("--compare-modes", action="store_true")
+    parser.add_argument("--compare-compile", action="store_true")
     parser.add_argument(
         "--capacity-length", type=int, help="Reserved table capacity in tokens"
     )
@@ -487,12 +488,20 @@ def main(argv=None):
             or args.query_tile != 16
             or args.compare_query_tiles
             or args.compare_modes
+            or args.compare_compile
         ):
             parser.error("Suite requires --layers 1, persistent mode and --output-json")
         run_suite(args)
         return
     if args.resume:
         parser.error("--resume requires --suite")
+    if args.compare_compile and (
+        args.compare_query_tiles
+        or args.compare_modes
+        or args.compare_planners
+        or args.diagnose
+    ):
+        parser.error("--compare-compile uses the existing single-plan layer window")
     if args.compare_modes and (
         args.query_tile != 32
         or args.mode != "persistent"
@@ -525,7 +534,10 @@ def main(argv=None):
     capacity = max(lengths) if args.capacity_length is None else args.capacity_length
     if capacity < max(lengths):
         parser.error("--capacity-length must cover every live length")
-    return run_case(args, lengths, capacity)
+    result = run_case(args, lengths, capacity)
+    if args.compare_compile and args.output_json:
+        atomic_json(Path(args.output_json), dict(complete=True, result=result))
+    return result
 
 
 def run_case(args, lengths, capacity, *, suite=False):
@@ -735,6 +747,40 @@ def run_case(args, lengths, capacity, *, suite=False):
             result[configuration_field][str(key)]["topology"] = describe_prepared_plan(
                 selected_plan
             )
+    if args.compare_compile:
+        explanation = torch._dynamo.explain(candidate)()
+        targets = [
+            str(node.target)
+            for g in explanation.graphs
+            for node in g.graph.nodes
+            if node.op == "call_function"
+        ]
+        counts = dict(
+            plan=sum("experimental_xqa_bucket_plan" in name for name in targets),
+            compute=sum("experimental_xqa_bucket_compute" in name for name in targets),
+        )
+        assert explanation.graph_count == 1 and explanation.graph_break_count == 0
+        assert counts == dict(plan=int(not plan.direct), compute=args.layers)
+        # explain() resets Dynamo caches; warm the real Inductor call afterward.
+        compiled_candidate = torch.compile(candidate, fullgraph=True)
+        compiled_candidate()
+        result.update(
+            compiled_backend="default Inductor fullgraph",
+            captured_ops=counts,
+            compiled_fx_graph=explanation.graphs[0].code,
+            assignments_per_window=dict(
+                eager_per_layer=0 if plan.direct else args.layers,
+                eager_once=0 if plan.direct else 1,
+                compiled_once=0 if plan.direct else 1,
+            ),
+        )
+        print(dict(compiled_public_window=counts), flush=True)
+
+        def per_layer_prepare():
+            for operands in bank:
+                plan.prepare()
+                compute(plan, [operands])
+
     if args.diagnose:
         if plan.direct:
             # Explicitly derived outside timing; not a profiler launch record.
@@ -808,7 +854,7 @@ def run_case(args, lengths, capacity, *, suite=False):
             ),
             flush=True,
         )
-    if args.benchmark or args.diagnose or suite or comparison:
+    if args.benchmark or args.diagnose or suite or comparison or args.compare_compile:
         # Warm both and bracket the candidate with native; report absolute samples.
         windows = (
             ("native_before", native),
@@ -816,7 +862,15 @@ def run_case(args, lengths, capacity, *, suite=False):
             ("native_after", native),
         )
         direct_aliases = {}
-        if comparison:
+        if args.compare_compile:
+            windows = (
+                ("native_before", native),
+                ("eager_per_layer_prepare", per_layer_prepare),
+                ("eager_once_prepare", candidate),
+                ("compiled_once_prepare", compiled_candidate),
+                ("native_after", native),
+            )
+        elif comparison:
             windows = [("native_before", native)]
             for key, selected_plan in plans.items():
                 selected_bank = banks[key]

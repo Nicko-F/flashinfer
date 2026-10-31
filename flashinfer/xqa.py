@@ -152,7 +152,7 @@ def xqa_decode_with_buckets(
     Packed data and scale byte strides are retained.
     ``page_table`` is contiguous int32 ``[B, plan.table_width]``; all page IDs
     reached by live lengths must address allocated cache pages. Zero-length
-    rows write zeros. There are no sliding windows, sinks or speculative rows.
+    rows write zeros. There are no sliding windows, sinks, ragged queries or tree masks.
 
     Direct plans derive split geometry from live device lengths and have a
     no-op ``prepare()``. For prepared plans, refresh descriptors after updating
@@ -164,6 +164,11 @@ def xqa_decode_with_buckets(
     workspace are mutable and may not be shared by concurrent calls. Pass
     ``out`` to avoid allocation during capture. Native XQA remains unchanged;
     callers select their native fallback for unsupported cases.
+
+    Create the plan/workspace and warm the experimental public call before
+    compilation or capture. GPU ``plan.prepare()`` may be compiled once before
+    multiple layer consumers; Host preparation stays outside compiled consumers.
+    The local dispatcher boundary declares descriptor/workspace/output mutations.
     """
     from .experimental.xqa_decode_buckets import run
 

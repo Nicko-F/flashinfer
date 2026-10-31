@@ -1,7 +1,7 @@
 # SM120 NVFP4 decode bucket module plan
 
-Current stage: expand module geometry before framework integration. Native XQA
-remains the default; the experimental API is opt-in. Git tracks implementation
+Current stage: compilation and shared-plan reuse qualified; framework integration
+is next. Native XQA remains the default; the experimental API is opt-in. Git tracks implementation
 history on `feat/sm120-nvfp4-decode-bucketing`.
 
 ## Completed
@@ -37,6 +37,75 @@ matrix at stage completion, not after every patch. No service or TP4 run belongs
 to this stage.
 
 ## Subsequent contribution work
+
+### Completed slice: real compile contract and shared-plan layer window
+
+Starting source audit: shared FlashInfer registration decorators are identity functions;
+the previous bucket public run called data_ptr/storage pointers, hardware lookup
+and JIT/FFI Python paths. Native test_batch_decode_kernels.py uses a module-level
+torch.library boundary; experimental b12x also registers real custom ops with
+mutated outputs and fake implementations. Reuse that PyTorch mechanism locally,
+without editing global decorators, inventing a handle registry or hiding mutations.
+
+Register actual bucket plan/compute ops at backend import. Keep the existing
+eager direct-FFI implementation available; compiled calls cross an opaque op
+boundary sharing the same implementation. Declare tasks/requests/spans/header
+and scratch/semaphores/output mutations correctly. Move storage-pointer alignment
+and output-alias checks inside the real implementation, not into fake tracing;
+retain traceable metadata checks. Resolve default PDL/hardware state in cold plan
+creation. Plan construction/JIT/workspace allocation stay outside compile/capture.
+Host planning/upload stays outside compiled graphs; GPU prepare can be compiled
+once before multiple consumers. Preserve causal math, layouts, kernels, explicit
+modes, output-buffer semantics and all existing defaults.
+
+Evidence: actual torch.library.opcheck where applicable, default Inductor
+torch.compile(fullgraph=True) of the public call (no suppress_errors/eager-only
+backend/private-call substitution), changed Q/cache/lengths including zero/restore,
+and unchanged numerical tolerances. Cover a direct q1 and prepared M32 modes;
+host prepare outside a compiled consumer gets a bounded anchor. A two-layer
+call prepares once and consumes independent layer operands/workspaces; inspect
+captured operators to verify one plan and two computes. Do not label this a
+whole-model/vLLM integration or serving result.
+
+Budget remains the qualified native core; binding changes must not allocate a
+per-token workspace or synchronize/read GPU lengths to CPU. Mutation handling
+may introduce compiler copies: inspect graph and targeted timings, and diagnose
+any material overhead rather than dropping mutation declarations. Use the existing
+test/example/runner with one selected idle GPU,128GiB memory floor,threads2,
+bounded heartbeat/timeouts. Finish coherent interface changes and focused checks,
+then one two-layer reuse timing anchor with current native/eager/compiled controls;
+no full22-case/service rerun. Material redesign returns to lead; no blind retries.
+
+Qualification now exercises actual default Inductor fullgraph execution on
+PyTorch 2.14.0+cu130. Direct q1, both prepared M32 modes, Host-prepared compiled
+consumption and shared-plan two-layer changed-input Graph replay passed. The
+two-layer generated code contains one plan op and two compute ops; inspection
+found no unconditional capacity-workspace copies or extra generated math kernels.
+Read-only inputs have Inductor's conditional `copy_if_misaligned` guards.
+
+Two test-tool expectations were corrected without changing the library math:
+PyTorch schema checking calls unsupported FP8 `allclose`/`mul_cuda`, so the exact
+observed limitation is reported, while fake checks and read-only input byte
+immutability are still verified. Plan schema checking passes. Also, a compiled
+consumer may realign an unaligned read-only input and succeed, whereas eager
+must reject it. Do not require identical rejection behavior after compiler input
+normalization. Preserve both original failed runs and their explanations.
+
+The corrected storage-behavior test passed without library changes: compiled
+aliasing was rejected, and misaligned query/output inputs were normalized and
+passed numerical checks. One matched B32 x 4096, H4/R6/P32/T3/M32 aligned
+two-layer timing invocation measured native before/after 317.920/322.730 us,
+eager per-layer preparation 337.066 us, eager shared preparation 330.102 us and
+compiled shared preparation 331.997 us. Sharing the plan reduces this observed
+window by 2.07%; eager shared remains 3.05% slower than the native paired mean 320.325 us.
+Native bracket drift is 1.50%, so the 0.57% compiled-versus-eager difference is not
+a stable compiler performance claim. No extra curve or timing retry was run.
+
+Lead conclusion: the compile and shared-plan interface prerequisite is complete
+for these bounded cases. Kernel math/defaults remain unchanged. The next scoped
+work is the existing vLLM metadata lifecycle and native fallback integration,
+not another binding microbenchmark or per-shape threshold search. Small/uniform
+regressions remain visible and must not become a universal faster-backend claim.
 
 ### Completed slice: balanced-load task ownership diagnosis
 
@@ -142,12 +211,10 @@ integration. Do not expand the service matrix to diagnose this module issue.
   a blanket faster-backend claim.
 - Integrate at the framework metadata boundary, reusing one plan across compatible
   layers and preserving changed-input Graph replay.
-- Add the relevant FlashInfer/vLLM native tests, real compile/opcheck checks and benchmark
-  integration. Module measurements alone do not establish serving gains.
-  Source audit: this checkout's `flashinfer/utils.py` registration decorators
-  currently return the original function; decorator presence in the bucket
-  backend is not evidence of dispatcher registration or compile support. Verify
-  the actual compiled public call and its mutation contract in a separate slice;
-  do not change shared FlashInfer decorators as a local workaround.
+- Add relevant vLLM metadata/lifecycle tests and benchmark integration. The
+  bounded real compile qualification above is complete, with the FP8 schema
+  checker limitation explicitly recorded. Module measurements alone do not
+  establish serving gains. Keep the actual local dispatcher registration;
+  shared FlashInfer identity decorators were not changed as a workaround.
 - Prepare maintainer-facing scope, limitations and evidence before an upstream
   PR. No upstream acceptance or submitted PR is claimed.

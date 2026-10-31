@@ -730,3 +730,75 @@ Use `--suite query_modes4 --layers 1 --output-json ownership.json` to reproduce
 the finite comparison. Its JSON includes raw samples, output errors, resources,
 meaningful descriptors and owner/partial histograms. The native launch report
 uses the generic SM120 M32 mapping with its source basis explicitly recorded.
+
+## Real compile boundary and shared-plan window (2026-10-31 UTC)
+
+The backend now registers real local `torch.library` plan/compute operators with
+explicit descriptor and scratch/semaphore/output mutations and no-output fake
+implementations. Compiled calls use that opaque dispatcher boundary; eager calls
+retain the same direct FFI implementation. Shared FlashInfer decorators, native
+kernels, layouts, arithmetic, modes and defaults are unchanged. Pointer alignment
+and output-alias checks execute inside the real implementation; traceable tensor
+metadata stays outside. Default PDL capability is resolved once in the cold plan.
+
+Qualification used installed PyTorch 2.14.0+cu130. The workflow first creates the
+plan/workspaces, performs normal eager warmup (including the experimental warning
+and JIT), and then calls the actual public entry under default Inductor
+`torch.compile(fullgraph=True)`. Cold JIT and the first warning are not covered
+by that full-graph claim. Five public configurations passed changed Q/K/V and
+device lengths, including zero/restore, under CUDA Graph replay: direct q1,
+prepared M32 persistent/aligned, a Host-prepared compiled consumer, and a two-layer
+shared-plan call with independent operands/workspaces. The latter captures one
+GPU plan and two compute operators; Host fill/upload remains outside its compiled
+consumer. This is fixed-shape module/interface coverage, not a model integration.
+
+Actual `opcheck` plan `test_schema` and `test_faketensor` checks passed. Compute
+`test_faketensor` passed; its schema checker hits an installed-PyTorch limitation:
+`allclose` on read-only FP8 scales calls unsupported Float8 `mul_cuda`. The failed
+attempt is preserved and handled only for that observed exception. Read-only
+compute inputs were independently checked unchanged through byte views outside
+timing. Autograd and dynamic-AOT opcheck subtests were not claimed; real public
+Inductor replay provides the functionalization/numerical check using the existing
+3% tolerance. No attention-output bitwise gate was added.
+
+Eager alias and misalignment guards still reject invalid storage. In this Torch
+build, compiled aliasing was rejected, while unaligned query/output buffers were
+accepted and numerically checked after compiler normalization. Generated code
+contains conditional `copy_if_misaligned` calls. Compiled rejection of every
+unsupported original layout is therefore not promised. The initial stricter
+negative-input assertion was preserved, then only that test was corrected/rerun;
+passed prepared/Host/shared-layer checks were retained.
+
+One two-layer timing invocation used shared B32 lengths `32 x 4096`, H4/R6/P32,
+T3/M32 aligned, on physical GPU7/NUMA1 with seed0 and independent layer operands,
+outputs and workspaces. The existing helper uses five warmups and twenty hot
+CUDA Graph samples per arm, CUPTI off and cold-L2 handling off. JIT, compilation,
+warnings and allocations are outside timing. Native keeps its default dispatch.
+These are complete two-attention GPU windows in microseconds, excluding CPU wall
+and model/serving costs:
+
+| Window | GPU Assign calls | Median (us) |
+| --- | ---: | ---: |
+| Native before | 0 | 317.920 |
+| Eager prepare before each layer | 2 | 337.066 |
+| Eager shared prepare | 1 | 330.102 |
+| Inductor shared prepare | 1 | 331.997 |
+| Native after | 0 | 322.730 |
+
+The native paired mean is 320.325 us with 1.50% bracket drift. Shared eager and
+compiled windows remain 3.05% and 3.64% slower than that native mean. Eager shared
+preparation is 2.07% shorter than eager per-layer preparation in this observation;
+components are not assumed additive. The small compiled/eager difference does
+not establish a compile speedup or stable overhead estimate. No timing was rerun.
+
+The final Inductor `output_code` contains one plan and two compute calls, with
+no unconditional capacity-sized clone/copy allocation or additional generated GPU
+kernel in that aligned-input window. Conditional alignment helpers remain. The
+mutation schemas were retained throughout. Runtime compute resources remain
+228 registers, 86,656 shared bytes, 112 stack bytes and one CTA/SM, reusing the
+unchanged kernel qualification. No global registration workaround, handle registry,
+automatic mode policy, full matrix or service run was introduced.
+
+Use `--compare-compile --layers 2 --mode aligned --query-tile 32 --q-len-per-req 3 --output-json compile.json`
+with the desired explicit inputs to compare the same integration boundary.
+The JSON output retains all samples, output checks and captured operator counts.

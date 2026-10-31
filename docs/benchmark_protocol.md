@@ -86,3 +86,22 @@ device descriptors and owner/partial counts are copied outside timing. Generic
 SM120 native grids are explicitly marked source-derived, not profiler-observed.
 One native bracket surrounds both modes. Compare within the matched physical
 GPU/NUMA run; historical timings on another GPU are context, not direct controls.
+
+## Compile and shared-plan integration anchor
+
+The bounded compile follow-up uses the public bucket API with default Inductor
+and `fullgraph=True`, then CUDA Graph replay with changed inputs. A separate
+Dynamo explanation checks operator counts; it does not replace actual Inductor
+execution. Plan construction, JIT, workspace allocation and Host descriptor
+uploads stay outside compilation/capture. The GPU planner may be captured once
+before multiple compatible attention consumers.
+
+The timing anchor is two independent attention layers sharing request metadata:
+B32, uniform4096, P32, H4, R6, T3, M32, aligned mode. Compare native before/after,
+eager per-layer preparation, eager once-per-window preparation and compiled
+once-per-window preparation on identical operands and one GPU/CPU placement.
+Each layer has its own output and workspace. Use the existing hot CUDA Graph
+helper and record all samples; count actual plan/compute operations and inspect
+Inductor output for additional copies or kernels. This measures a two-attention
+module window, not a whole transformer block or vLLM serving latency. It does
+not claim that `torch.compile` itself fuses the opaque attention kernels.
